@@ -2275,6 +2275,17 @@ impl Resource {
     }
 }
 
+/// The width and height the title gave texture `this` (`None` for a buffer
+/// or no resource): what a draw's depth texture is told by
+/// (`crate::draw`'s `depth_skips`).
+pub(crate) fn texture_size(this: This) -> Option<(u64, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let desc = &resource(this).desc;
+    (desc.dimension != BUFFER).then_some((desc.width, desc.height))
+}
+
 fn resource<'a>(this: This) -> &'a Resource {
     // SAFETY: called from resource methods only.
     unsafe { &*this.cast::<Resource>() }

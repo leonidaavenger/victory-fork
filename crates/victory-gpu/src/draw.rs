@@ -489,6 +489,105 @@ pub(crate) fn window_line(frames: f64) {
     );
 }
 
+/// One entry of `VICTORY_SKIP_DEPTH_DRAWS`: a depth texture's size and
+/// the viewport tops named with it (none: every viewport).
+#[derive(Debug, PartialEq)]
+struct DepthSkip {
+    size: (u64, u32),
+    tops: Vec<i64>,
+}
+
+/// Depth-only draws left out by what they draw into
+/// (`VICTORY_SKIP_DEPTH_DRAWS=<width>x<height>[@<top>[+<top>...]],...`;
+/// unset: none).
+///
+/// Why: a draw costs this layer about 12 microseconds of the frame
+/// whatever it draws (the frame is 20 ms + 11.7 ms per 1,000 draws on the
+/// test machine), and the title spends a large share of its draws on
+/// shadow maps. A captured frame of the opening has 4,888 draws: 1,917 of
+/// them depth-only into the sun's 2048x8192 texture (four viewports of
+/// 2048 rows, a cascade each: 373, 745, 716 and 83 draws from the nearest
+/// on), 209 into 1024x1024 and 512x512 depth textures (lamps), 539 into
+/// the depth of the picture itself. `2048x8192` leaves the sun's shadow
+/// draws out, `2048x8192@2048+4096` the two middle cascades only. The
+/// texture is still cleared, so what would have been in shadow there is
+/// lit. The depth of the picture itself must not be named: the colour
+/// passes test against it.
+///
+/// `VICTORY_SKIP_DEPTH_DRAWS_ALT=1`: the list is heeded twenty seconds and
+/// left alone twenty, in turn, each change said in the log, to measure it
+/// in one scene.
+fn depth_skips() -> &'static [DepthSkip] {
+    static LIST: std::sync::OnceLock<Vec<DepthSkip>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_DEPTH_DRAWS").unwrap_or_default();
+        let list = parse_depth_skips(&value);
+        if !list.is_empty() {
+            tracing::info!(
+                entries = list.len(),
+                "depth-only draws into the depth textures named are left out (VICTORY_SKIP_DEPTH_DRAWS={value})"
+            );
+        }
+        list
+    })
+}
+
+/// The entries of a `VICTORY_SKIP_DEPTH_DRAWS` value; one that does not
+/// read as `<width>x<height>[@<top>+...]` is said and left out.
+fn parse_depth_skips(value: &str) -> Vec<DepthSkip> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let (size, tops) = entry.split_once('@').unwrap_or((entry, ""));
+            let size = size.split_once('x').and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)));
+            let tops: Option<Vec<i64>> =
+                tops.split('+').map(str::trim).filter(|t| !t.is_empty()).map(|t| t.parse().ok()).collect();
+            match (size, tops) {
+                (Some(size), Some(tops)) => Some(DepthSkip { size, tops }),
+                _ => {
+                    tracing::warn!(entry, "VICTORY_SKIP_DEPTH_DRAWS expects <width>x<height>[@<top>+<top>...]");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// With `VICTORY_SKIP_DEPTH_DRAWS_ALT=1`: whether the list is heeded now.
+fn depth_skip_turn() -> bool {
+    static ALT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ALT.get_or_init(|| std::env::var_os("VICTORY_SKIP_DEPTH_DRAWS_ALT").is_some_and(|v| v == "1")) {
+        return true;
+    }
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+        tracing::info!(
+            "depth-only draws into the depth textures named are left out from now (VICTORY_SKIP_DEPTH_DRAWS_ALT=alt): {}",
+            if on { "ON" } else { "off, they are drawn" }
+        );
+    }
+    on
+}
+
+/// Draws [`State::depth_skipped`] left out since the last line.
+static DEPTH_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// With the frame-rate line: the draws left out by their depth texture.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn depth_skip_line(frames: f64) {
+    let skipped = DEPTH_SKIPPED.swap(0, Ordering::Relaxed);
+    if skipped != 0 {
+        tracing::info!(
+            "depth-only draws left out by their depth texture per frame (VICTORY_SKIP_DEPTH_DRAWS): {:.0}",
+            skipped as f64 / frames
+        );
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -518,6 +617,9 @@ pub(crate) struct State {
     /// list: a draw's pipeline is one for them
     /// (`crate::pipeline::host_pipeline_for`).
     target_formats: crate::pipeline::host::TargetFormats,
+    /// What [`State::depth_skipped`] last found: the depth resource and the
+    /// first viewport's top it looked at, and its answer for them.
+    depth_skip: (usize, i64, bool),
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -1255,6 +1357,7 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        self.depth_skip = (0, 0, false);
         // The formats of the host views, for the draws' pipelines.
         let mut formats = [0; 9];
         let mut rtvs = Vec::new();
@@ -1509,6 +1612,27 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
+    /// Whether this draw is one `VICTORY_SKIP_DEPTH_DRAWS` leaves out
+    /// ([`depth_skips`]): no render target is bound, the depth texture has
+    /// a listed size and, if the entry names viewport tops, the first
+    /// viewport's top is one of them. Counted when it is.
+    fn depth_skipped(&mut self) -> bool {
+        let skips = depth_skips();
+        if skips.is_empty() || !self.targets.is_empty() || self.depth == 0 || !depth_skip_turn() {
+            return false;
+        }
+        let top = self.viewports.first().map_or(i64::MIN, |v| v.TopLeftY as i64);
+        if self.depth_skip.0 != self.depth || self.depth_skip.1 != top {
+            let skipped = crate::resource::texture_size(self.depth as This)
+                .is_some_and(|size| skips.iter().any(|s| s.size == size && (s.tops.is_empty() || s.tops.contains(&top))));
+            self.depth_skip = (self.depth, top, skipped);
+        }
+        if self.depth_skip.2 {
+            DEPTH_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        self.depth_skip.2
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -1519,6 +1643,9 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            return false;
+        }
+        if self.depth_skipped() {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
@@ -4171,6 +4298,11 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
+        // A depth-only draw the list of [`depth_skips`] names (not a
+        // dispatch, kind 2): left out before the argument clamp too.
+        if kind != 2 && self.depth_skipped() {
+            return false;
+        }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
@@ -4915,5 +5047,22 @@ mod tests {
         // No records at all: the constants' own.
         put(&mut constants, 0x7c, 2);
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod depth_skip_tests {
+    use super::{DepthSkip, parse_depth_skips};
+
+    /// Sizes alone, sizes with viewport tops, and entries that are not read.
+    #[test]
+    fn depth_skip_entries_are_sizes_with_optional_viewport_tops() {
+        assert_eq!(parse_depth_skips(""), vec![]);
+        assert_eq!(
+            parse_depth_skips("2048x8192@2048+4096, 1024x1024"),
+            vec![DepthSkip { size: (2048, 8192), tops: vec![2048, 4096] }, DepthSkip { size: (1024, 1024), tops: vec![] }]
+        );
+        assert_eq!(parse_depth_skips("512x512@0"), vec![DepthSkip { size: (512, 512), tops: vec![0] }]);
+        assert_eq!(parse_depth_skips("2048, x, 10x10@a, 64x64"), vec![DepthSkip { size: (64, 64), tops: vec![] }]);
     }
 }
