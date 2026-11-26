@@ -533,18 +533,43 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    // A set, not the list: every draw and dispatch asks, and a list of a
+    // thousand hashes (a fork's ray-tracing skip list has 1,034) walked for
+    // each shader of each draw was some 4 microseconds a draw.
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_skip_hashes(&value).into_iter().collect()
     });
-    if hashes.is_empty() {
+    if hashes.is_empty() || !skip_turn() {
         return None;
     }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| hashes.contains(shader.hash.as_str()))
         .map(|shader| shader.hash.as_str())
+}
+
+/// `VICTORY_SKIP_PIPELINES_ALT=1`: the skip list is heeded twenty seconds
+/// and left alone twenty, in turn, each change said in the log, so that
+/// one run measures what the skipped shaders cost in one scene. Unset:
+/// the list is always heeded.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_turn() -> bool {
+    static ALT: OnceLock<bool> = OnceLock::new();
+    if !*ALT.get_or_init(|| std::env::var_os("VICTORY_SKIP_PIPELINES_ALT").is_some_and(|v| v == "1")) {
+        return true;
+    }
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+        tracing::info!(
+            "the shaders of the skip list are skipped from now (VICTORY_SKIP_PIPELINES_ALT=alt): {}",
+            if on { "ON" } else { "off, they run" }
+        );
+    }
+    on
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
