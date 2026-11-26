@@ -1772,6 +1772,14 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    let left = [0, 1].map(|i| UAV_BACK_LEFT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if left[0] != 0.0 {
+        tracing::info!(
+            "shader writes to copies in the card's memory left on the card per frame (VICTORY_UAV_BACK=0): {:.0} declarations of {:.1} MB, counted each time",
+            left[0],
+            left[1] / (1 << 20) as f64
+        );
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -2008,6 +2016,57 @@ fn merge_gap() -> usize {
     static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
 }
+
+/// Whether what shaders write to a copy in the card's memory is copied
+/// back into title memory (`VICTORY_UAV_BACK=0`: it is not; on by
+/// default).
+///
+/// Why: finding and fetching those bytes is most of what the layer adds to
+/// a frame beside the title's own lists, and almost nothing reads them in
+/// title memory afterwards (`crate::backreads`, run 277: of 438,000 stores
+/// looked at, 0.19 % were touched by anything but the layer and the
+/// title's own writes). Measured on an RTX 4070 Ti behind a x4 link, the
+/// first rooms at about 3,600 draws: the card's send-and-hash lists 17.5 ->
+/// 0.9 ms a frame, its compare lists 5.5 -> 0, the copy-back 35 ms and
+/// 55 MB a frame -> 0, the write-watch asking and the settles 13.1 -> 5.7
+/// ms of the submitting thread; the usual frame 95 -> 88 ms (the
+/// submitting thread is then the limit, the card idles 27 ms), and the
+/// picture of those rooms was as before.
+///
+/// What it gives up: title memory keeps the bytes the title last wrote
+/// there. The title's own reads of what its shaders computed, the title's
+/// buffer copies out of such a range (they are made in title memory), and
+/// another host copy of the same memory (a window outside buffers, a
+/// texture) see the older bytes. A copy in the PC's memory is not
+/// affected: its shader writes go back as before, since a refresh of it
+/// stores whole pages.
+///
+/// Wants `VICTORY_COPY_CHANGED=1`: a refresh then sends the card only the
+/// bytes that differ from the copy's CPU side, which holds what title
+/// memory held at the last refresh, so what shaders wrote on the card
+/// beside them stays. Without it a refresh sends whole pages the title
+/// wrote to, and the older bytes with them.
+///
+/// shortcut: a write by the title of the bytes that are there already
+/// (a counter set to 0 again) is no difference and does not reach the
+/// card, where a shader may have changed them since.
+fn uav_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_UAV_BACK").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!(
+                copy_changed = copy_changed(),
+                "what shaders write to copies in the card's memory is not copied back into title memory (VICTORY_UAV_BACK=0; wants VICTORY_COPY_CHANGED=1)"
+            );
+        }
+        on
+    })
+}
+
+/// With [`uav_back`] off, since the last line: declarations of shader
+/// writes left out, and their bytes.
+static UAV_BACK_LEFT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether a refresh of a copy in the card's memory stores and sends on
 /// only the bytes that differ from the copy's CPU side
@@ -2874,6 +2933,15 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        // Left on the card (`VICTORY_UAV_BACK=0`, [`uav_back`]): nothing is
+        // declared, so nothing is hashed, compared, fetched or merged for
+        // the range and no refresh waits on it. Later shaders read what
+        // was written from the card's side, as before.
+        if self.card.is_some() && !uav_back() {
+            UAV_BACK_LEFT[0].fetch_add(1, Ordering::Relaxed);
+            UAV_BACK_LEFT[1].fetch_add(len, Ordering::Relaxed);
+            return;
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
