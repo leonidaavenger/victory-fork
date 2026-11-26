@@ -61,6 +61,70 @@ fn heap_locks() -> bool {
     }
 }
 
+/// Whether a title slot's host descriptor is made under a lock of the
+/// slot's own, with the heap's slots' lock (`made`) let go, instead of
+/// under `made` (`VICTORY_HEAP_SLOT_LOCKS=1`; OFF unless set).
+///
+/// Profile M0b (96.2 ms a frame, [`heap_locks`] on): the recording threads
+/// wait 22.75 ms a frame for `made` in [`HostHeap::mirror`], the
+/// submitting thread 3.2 ms; `made` is held about 4.5 ms a frame by the
+/// recording threads and 6.2 ms by the submitting thread
+/// (`super::sync_heaps`, one changed record after another, the lock taken
+/// again as soon as it is given back). Half of what was done under it is
+/// the making of the slot: the view call into Direct3D ([`make`], with
+/// [`buffer_srv`] finding the host copy), the null views, and
+/// [`HostHeap::keep`], which takes a piece of `kept` and retires the old
+/// resource (`crate::host::retire`, itself a lock the recording threads
+/// queue on, so a wait there was a wait of everyone behind `made`).
+///
+/// With the switch `made` is held while what the slot is to show is
+/// decided (the record looked up, [`HostHeap::note_buffer`] and the stale
+/// slots it names made null, the waits for host copies); then the slot's
+/// lock ([`HostHeap::making`]) is taken, `made` is let go, and the slot is
+/// made and kept under the slot's lock alone. What a slot ends up showing
+/// and keeping is what it did before. What this relies on, all with the
+/// switch on:
+/// - A slot's lock is taken only with `made` held. So a take waits at
+///   most for the one making handed over before it, and the makings of a
+///   slot run in the order of the decisions that asked for them: the slot
+///   ends with what the last decision said, as under the one lock.
+/// - What writes a title slot's host descriptor or what the slot keeps
+///   holds the slot's lock: [`HostHeap::mirror`], [`HostHeap::unmake`],
+///   [`HostHeap::texture_views_remade`]. (Dynamic slots are their table's
+///   list's alone, as before.) No slot is written by two threads at once.
+/// - `made_now` is set to a record only under the slot's lock, once the
+///   slot is made and kept, and is set to 0 under it before the slot is
+///   written. A 0 set with `made` alone may be overwritten by a making
+///   handed over earlier: that making had finished the slot, so what
+///   `made_now` says is still true of the slot.
+/// - What finds under `made` a slot made from a record whose `made_now`
+///   is not set yet (its making was handed over and runs) takes the slot's
+///   lock before it reads or uses the slot, and so finds it made, as under
+///   the one lock: [`HostHeap::mirror`] for a slot that is as it was,
+///   [`HostHeap::texture_slot_made_from`].
+/// - The locks are taken in the order `made`, a slot's lock, what making
+///   takes. Making takes what it took under `made` before, nothing that
+///   takes `made` or a slot's lock; no thread holds two slots' locks.
+///
+/// No `alt`: in turn, a thread could make a slot under `made` alone while
+/// another makes it under the slot's lock alone.
+fn slot_locks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HEAP_SLOT_LOCKS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("the host heap's slots are made under their own locks, the slots' lock let go (VICTORY_HEAP_SLOT_LOCKS=1)");
+        }
+        on
+    })
+}
+
+/// One of the locks [`slot_locks`] makes slots under: slot `i` is behind
+/// lock `i % KEPT_PIECES`. On a cache line of its own: neighbouring slots
+/// are made by different threads.
+#[repr(align(64))]
+struct SlotLock(Mutex<()>);
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -73,10 +137,13 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
+    /// (With [`slot_locks`]: was decided to be made from; the making may
+    /// run still, under the slot's lock.)
     made: Mutex<Vec<u64>>,
     /// The same, readable without the lock ([`heap_locks`]): written under
     /// the lock wherever `made` is, to 0 before a slot is made again and
-    /// to its record only once the slot is made and kept.
+    /// to its record only once the slot is made and kept (with
+    /// [`slot_locks`]: under the slot's lock).
     made_now: Vec<std::sync::atomic::AtomicU64>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
@@ -91,6 +158,9 @@ pub(crate) struct HostHeap {
     /// Without [`heap_locks`]: the one line every `keep` stands in, as
     /// when `kept` was behind one lock.
     kept_one: Mutex<()>,
+    /// With [`slot_locks`]: the locks title slots are made and kept under,
+    /// [`KEPT_PIECES`] of them ([`HostHeap::making`]).
+    making: Vec<SlotLock>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -158,9 +228,10 @@ pub(crate) struct HostHeap {
 /// was held where the slot was as it was, where it had changed; 8, 9: the
 /// calls so timed; 10: calls of `keep`; 11, 12: takes of `kept` that found
 /// it held and their nanoseconds; 13, 14: the same for `next`
-/// ([`HostHeap::dynamic`]).
+/// ([`HostHeap::dynamic`]); 15, 16: the same for the slots' own locks
+/// ([`slot_locks`], [`HostHeap::making`]).
 #[cfg(feature = "diagnostics")]
-pub(crate) static LOCKS: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
+pub(crate) static LOCKS: [std::sync::atomic::AtomicU64; 17] = [const { std::sync::atomic::AtomicU64::new(0) }; 17];
 
 /// Diagnostics, since the last line (`crate::draw::tables_line`): why
 /// [`HostHeap::dynamic`] refused a table. 0: fewer slots were free than it
@@ -1172,6 +1243,7 @@ impl HostHeap {
                 .map(|_| Mutex::new(vec![None; (count + extra).div_ceil(KEPT_PIECES) as usize]))
                 .collect(),
             kept_one: Mutex::new(()),
+            making: (0..KEPT_PIECES).map(|_| SlotLock(Mutex::new(()))).collect(),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1552,14 +1624,20 @@ impl HostHeap {
         // slot is null and keeps nothing). The host copy of such a
         // texture is held by no slot, may have been let go, and would be
         // made anew here, with the card full. `made` first, then `kept`,
-        // as `mirror` takes them.
+        // as `mirror` takes them (with [`slot_locks`]: a making handed over
+        // is waited for in between).
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
-            && self.kept[(index % KEPT_PIECES) as usize]
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get((index / KEPT_PIECES) as usize)
-                .is_some_and(Option::is_some)
+        if !made.get(index as usize).is_some_and(|&made| made != 0 && made == key) {
+            return false;
+        }
+        self.made_by_now(index, key);
+        let kept = self.kept[(index % KEPT_PIECES) as usize]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get((index / KEPT_PIECES) as usize)
+            .is_some_and(Option::is_some);
+        drop(made);
+        kept
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -1664,10 +1742,14 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
+            // With [`slot_locks`]: under the slot's lock, after a making of
+            // it handed over earlier.
+            let making = slot_locks().then(|| self.making(slot));
             if let Some(kept) = make(&view, self.cpu(slot)) {
                 self.keep(slot, kept);
                 remade += 1;
             }
+            drop(making);
         }
         let before = VIEWS_REMADE[0].fetch_add(remade as u64, Relaxed);
         if flying > 0 {
@@ -1713,11 +1795,42 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        // With [`slot_locks`]: under the slot's lock, after a making of it
+        // handed over earlier (which set `made_now` when it was done).
+        let making = slot_locks().then(|| self.making(index));
+        if making.is_some()
+            && let Some(now) = self.made_now.get(index as usize)
+        {
+            now.store(0, std::sync::atomic::Ordering::Release);
+        }
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
         }
         self.keep(index, None);
+        drop(making);
+    }
+
+    /// With [`slot_locks`]: the lock slot `index` is made and kept under.
+    /// Taken only with `made` held (see there). Diagnostics builds count a
+    /// take that finds it held in [`LOCKS`] 15 and 16.
+    fn making(&self, index: u32) -> std::sync::MutexGuard<'_, ()> {
+        locked(&self.making[(index % KEPT_PIECES) as usize].0, 15)
+    }
+
+    /// With [`slot_locks`], `made` held, slot `index` found made from
+    /// `key`: waits until it is, if its making was handed over and runs
+    /// still (`made_now` is set once the slot is made and kept). Without
+    /// the switch a slot `made` names is made.
+    fn made_by_now(&self, index: u32, key: u64) {
+        if slot_locks()
+            && self
+                .made_now
+                .get(index as usize)
+                .is_some_and(|now| now.load(std::sync::atomic::Ordering::Acquire) != key)
+        {
+            drop(self.making(index));
+        }
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -2315,6 +2428,21 @@ impl HostHeap {
                 held.slot_changed();
                 made[index as usize] = 0;
                 self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                if slot_locks() {
+                    // The sets first, under `made`; then the null view under
+                    // the slot's lock alone ([`slot_locks`]). (The order of
+                    // the two is seen by no one: what reads the sets comes
+                    // to the slot through `made`.)
+                    let _ = self.note_buffer(index, None, false);
+                    let making = self.making(index);
+                    #[cfg(feature = "diagnostics")]
+                    drop(held);
+                    drop(made);
+                    self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                    self.make_null(index);
+                    drop(making);
+                    return None;
+                }
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -2359,11 +2487,41 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // The slot goes on showing what it was made from.
+                // The slot goes on showing what it was made from. (With
+                // [`slot_locks`]: once a making of that, handed over
+                // earlier, is done.)
+                let making = slot_locks().then(|| self.making(index));
                 self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
+                drop(making);
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            if slot_locks() {
+                // Decided: the slot's lock is taken (after a making of the
+                // slot handed over earlier, so the makings keep the order
+                // of their decisions), `made` let go, and the slot made and
+                // kept under the slot's lock alone ([`slot_locks`]).
+                let now = made[index as usize];
+                let making = self.making(index);
+                #[cfg(feature = "diagnostics")]
+                drop(held);
+                drop(made);
+                // A making handed over earlier set its record when it was
+                // done: not "made" again until this one is.
+                self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                let kept = if later {
+                    None
+                } else {
+                    make(&view, self.cpu(index))
+                };
+                if kept.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, kept.flatten());
+                self.made_now[index as usize].store(now, std::sync::atomic::Ordering::Release);
+                drop(making);
+                return Some(view);
+            }
             let kept = if later {
                 None
             } else {
@@ -2376,6 +2534,11 @@ impl HostHeap {
             // After the slot is made and kept: a reader without the lock
             // takes the record as made only once it is.
             self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
+        } else {
+            // Made from this record (with [`slot_locks`]: once a making of
+            // it, handed over and running still, is done; the caller uses
+            // the slot).
+            self.made_by_now(index, key);
         }
         Some(view)
     }

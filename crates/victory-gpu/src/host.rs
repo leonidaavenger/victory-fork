@@ -73,7 +73,8 @@ unsafe impl Sync for Host {}
 /// the submission count they wait for. The title's descriptor writes and
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
-/// texture (a device hang).
+/// texture (a device hang). With `VICTORY_RETIRE_SHARDS` they wait in the
+/// retiring thread's own list instead ([`retire_shards`]).
 static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -241,11 +242,147 @@ pub(crate) fn retire<T: 'static>(object: T) {
         reap(vec![Retired(Box::new(object))]);
         return;
     }
+    // Boxed before the lock is taken: as the push's argument the box was
+    // made under it (an allocation, with its counters), and every other
+    // thread that retired stood behind that.
+    let object = Retired(Box::new(object));
+    if retire_shards() {
+        let shard = retired_shard();
+        shard.count.fetch_add(1, Ordering::Relaxed);
+        shard.list.lock().unwrap_or_else(|e| e.into_inner()).push((started, object));
+        return;
+    }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((started, object));
+}
+
+/// Whether objects [`retire`] keeps for a running submission go to a list
+/// of the retiring thread's own ([`RETIRED_SHARDS`]) instead of the one all
+/// threads share, [`RETIRED`] (`VICTORY_RETIRE_SHARDS=1`; `alt`: twenty
+/// seconds with, twenty without, in turn, each change said in the log).
+/// Off by default.
+///
+/// Why: profile M0b (96.2 ms a frame; `VICTORY_HEAP_LOCKS`,
+/// `VICTORY_TABLE_STAGES`, `VICTORY_LIST_REUSE` and the heap pass switches
+/// on): the five recording threads stand 26.3 ms a frame in [`retire`],
+/// all of it waiting for [`RETIRED`]'s lock, almost all through
+/// `HostHeap::keep` (a dynamic slot of a table made afresh written over the
+/// object it held: some ten a draw, see [`retire_lean`]). Every push is
+/// short; the threads queue behind one another all the same.
+///
+/// With the switch each thread pushes to a list of its own (the next of
+/// [`RETIRED_SHARD_COUNT`] for every thread that retires, in turn) under
+/// that list's own lock, which only [`bury`] takes besides it. What an
+/// object waits for is unchanged: the submission count read when it was
+/// retired, and it is dropped by the first [`bury`] that finds that
+/// submission finished, or by a later one, as from [`RETIRED`]: never
+/// earlier. A push that comes after [`bury`] went past its list waits for
+/// the next [`bury`], as one that came after the take of [`RETIRED`] did.
+fn retire_shards() -> bool {
+    match retire_shards_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "objects kept for a running submission go to a list of the retiring thread's own from now (VICTORY_RETIRE_SHARDS=alt): {}",
+                    if on { "ON" } else { "off, to the one list as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// What `VICTORY_RETIRE_SHARDS` says: 0 unset (off), 1 on, 2 in turn.
+fn retire_shards_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_RETIRE_SHARDS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// The lists of [`retire_shards`]: more than the threads that retire while
+/// the card runs (five recording threads, the submitting thread, the heap
+/// worker, the one that lands flights), so that each has its own.
+const RETIRED_SHARD_COUNT: usize = 16;
+
+/// One list of [`retire_shards`], as [`RETIRED`]: the objects that wait and
+/// the submission count each waits for, and how many objects were kept so
+/// since the start (as [`RETIREMENTS`]`[1]`, for [`removal_context`]).
+/// Two cache lines of its own (the neighbouring line is fetched with a
+/// line): the threads that push to neighbouring lists do not take the
+/// lines from each other.
+#[repr(align(128))]
+struct RetiredShard {
+    list: Mutex<Vec<(u64, Retired)>>,
+    count: std::sync::atomic::AtomicU64,
+}
+
+static RETIRED_SHARDS: [RetiredShard; RETIRED_SHARD_COUNT] = [const {
+    RetiredShard {
+        list: Mutex::new(Vec::new()),
+        count: std::sync::atomic::AtomicU64::new(0),
+    }
+}; RETIRED_SHARD_COUNT];
+
+/// The list of [`RETIRED_SHARDS`] this thread pushes to: given at its first
+/// call, the next one in turn.
+fn retired_shard() -> &'static RetiredShard {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        /// This thread's list; `usize::MAX`: none given yet.
+        static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+    let at = MINE
+        .try_with(|mine| {
+            if mine.get() == usize::MAX {
+                mine.set(NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_SHARD_COUNT);
+            }
+            mine.get()
+        })
+        // A thread that retires while its own storage is being torn down:
+        // the first list (any list is as right).
+        .unwrap_or(0);
+    &RETIRED_SHARDS[at]
+}
+
+/// [`bury`] for the lists of [`retire_shards`]: each list is taken out whole
+/// under its lock and sorted with no lock held, what still waits put back
+/// (beside what its thread retired meanwhile; the order means nothing), and
+/// what is done dropped (or handed to the reaper) once, with no lock held.
+fn bury_shards(finished: u64) {
+    let done = sort_out_shards(&RETIRED_SHARDS, finished);
+    reap(done);
+}
+
+/// What [`bury_shards`] does with `shards`, but the dropping: the objects
+/// that waited for submissions up to `finished`, taken out of the lists.
+fn sort_out_shards(shards: &[RetiredShard], finished: u64) -> Vec<Retired> {
+    let mut done = Vec::new();
+    for shard in shards {
+        let all = std::mem::take(&mut *shard.list.lock().unwrap_or_else(|e| e.into_inner()));
+        if all.is_empty() {
+            continue;
+        }
+        let mut keep = Vec::new();
+        for (at, object) in all {
+            if at <= finished {
+                done.push(object);
+            } else {
+                keep.push((at, object));
+            }
+        }
+        if !keep.is_empty() {
+            shard.list.lock().unwrap_or_else(|e| e.into_inner()).append(&mut keep);
+        }
+    }
+    done
 }
 
 /// Whether descriptor slots written again with the object they already
@@ -319,6 +456,11 @@ pub(crate) fn slot_rewritten(old: &ID3D12Resource, new: Option<&ID3D12Resource>)
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
+    // The lists of `VICTORY_RETIRE_SHARDS`, if it was ever asked for (in
+    // turn, objects may wait in both places).
+    if retire_shards_mode() != 0 {
+        bury_shards(finished);
+    }
     if retire_lean() {
         // Taken out whole, sorted with no lock held, what still waits put
         // back (beside what was retired meanwhile; the order means nothing).
@@ -534,7 +676,11 @@ pub(crate) fn removal_context() -> String {
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
         crate::pipeline::library_removal_note(),
         RETIREMENTS[0].load(Ordering::Relaxed),
-        RETIREMENTS[1].load(Ordering::Relaxed),
+        RETIREMENTS[1].load(Ordering::Relaxed)
+            + RETIRED_SHARDS
+                .iter()
+                .map(|s| s.count.load(Ordering::Relaxed))
+                .sum::<u64>(),
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
@@ -10372,6 +10518,92 @@ mod trail {
         assert!(text.contains("pipeline library: no call running"));
         assert!(text.contains(&format!("thing {} done", super::TRAIL_MOST + 4)));
         assert!(!text.contains("thing 4 done"), "the oldest entries are dropped");
+    }
+}
+
+#[cfg(test)]
+mod retired_shards {
+    use super::{Retired, RetiredShard, sort_out_shards};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// What a test retires: the submission count it waits for.
+    struct Probe(u64);
+
+    fn shards(n: usize) -> Vec<RetiredShard> {
+        (0..n)
+            .map(|_| RetiredShard {
+                list: Mutex::new(Vec::new()),
+                count: AtomicU64::new(0),
+            })
+            .collect()
+    }
+
+    fn tags(done: &[Retired]) -> Vec<u64> {
+        let mut tags: Vec<u64> = done
+            .iter()
+            .map(|r| r.0.downcast_ref::<Probe>().expect("a probe").0)
+            .collect();
+        tags.sort_unstable();
+        tags
+    }
+
+    /// An object comes out once the submission it waits for has finished,
+    /// from whichever list it is in, and stays in its list until then.
+    #[test]
+    fn a_retired_object_is_buried_once_its_submission_finished() {
+        let shards = shards(4);
+        for (shard, at) in [(0, 3), (1, 5), (0, 4), (3, 3)] {
+            shards[shard].list.lock().unwrap().push((at, Retired(Box::new(Probe(at)))));
+        }
+        assert!(sort_out_shards(&shards, 2).is_empty());
+        assert_eq!(tags(&sort_out_shards(&shards, 3)), [3, 3]);
+        assert_eq!(shards[0].list.lock().unwrap().len(), 1, "the one for 4 waits");
+        assert_eq!(tags(&sort_out_shards(&shards, 4)), [4]);
+        assert_eq!(tags(&sort_out_shards(&shards, 9)), [5]);
+        assert!(shards.iter().all(|s| s.list.lock().unwrap().is_empty()));
+    }
+
+    /// Threads that retire into their own lists while submissions start,
+    /// finish and are buried, as `retire` and `bury` do it: nothing comes
+    /// out before the submission it waited for has finished, and nothing
+    /// pushed meanwhile is lost.
+    #[test]
+    fn objects_retired_on_many_threads_are_buried_in_time_and_all() {
+        const THREADS: usize = 4;
+        const EACH: u64 = 20_000;
+        let shards = shards(THREADS);
+        let (started, finished) = (AtomicU64::new(1), AtomicU64::new(0));
+        let (at_once, running) = (AtomicU64::new(0), AtomicUsize::new(THREADS));
+        let mut buried = 0u64;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let (shards, started, finished, at_once, running) = (&shards, &started, &finished, &at_once, &running);
+                scope.spawn(move || {
+                    for _ in 0..EACH {
+                        let s = started.load(Ordering::Acquire);
+                        if s <= finished.load(Ordering::Acquire) {
+                            at_once.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        shards[t].list.lock().unwrap().push((s, Retired(Box::new(Probe(s)))));
+                    }
+                    running.fetch_sub(1, Ordering::Release);
+                });
+            }
+            // The submitting side: the submission running finishes, what
+            // waited for it is buried, the next one starts.
+            while running.load(Ordering::Acquire) > 0 {
+                let this = started.load(Ordering::Acquire);
+                finished.store(this, Ordering::Release);
+                let done = sort_out_shards(&shards, this);
+                assert!(tags(&done).iter().all(|&at| at <= this), "buried before its submission finished");
+                buried += done.len() as u64;
+                started.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        buried += sort_out_shards(&shards, u64::MAX).len() as u64;
+        assert_eq!(buried + at_once.load(Ordering::Relaxed), THREADS as u64 * EACH);
     }
 }
 
