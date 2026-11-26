@@ -28,6 +28,11 @@
 //! bit ([`PUBLISHED`]): a range whose blocks all have theirs is answered
 //! from the journal alone, with no lock of the guards and no kernel call
 //! ([`light`]).
+//!
+//! With `VICTORY_GUARD_FAST` a write fault on a block whose page has no
+//! other guarded view opens it with one atomic change and no lock of ours
+//! ([`CLAIMS`]); what the guards hold of the block is brought up to date by
+//! the next look at it under their lock ([`settle_claims`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -632,9 +637,11 @@ fn known_view(start: usize) -> bool {
 }
 
 struct Guards {
-    /// Blocks we made read-only.
+    /// Blocks we made read-only. (With [`guard_fast`], also a block a fault
+    /// has opened without the lock, until the next look at it settles its
+    /// claim: [`CLAIMS`].)
     protected: BTreeSet<usize>,
-    /// Of those, the ones not written since a copy took them.
+    /// Of those, the ones not written since a copy took them (the same).
     clean: BTreeSet<usize>,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
@@ -715,9 +722,11 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 }
 
 /// Whether the block `page` is read-only by our hand and unwritten since a
-/// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
+/// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`). One a fault
+/// claimed without the guards' lock is not, though their sets still say so
+/// until the next look ([`settle_claims`]).
 pub(crate) fn clean(page: usize) -> bool {
-    guards().clean.contains(&page)
+    guards().clean.contains(&page) && !CLAIMS.claimed(page)
 }
 
 /// `VICTORY_LIGHT_REFRESH`: 0 off, 1 on, 2 in turn ([`light`]).
@@ -879,6 +888,15 @@ impl Bits {
 /// ([`title_memory_remapped`], [`title_memory_committed`]). Clearing does
 /// nothing where no bit was ever set, so it is not behind the switch.
 ///
+/// A write fault that opens a block without the guards' lock
+/// ([`guard_fast`]) clears its bit with no lock at all, after its claim of
+/// the block and before the write access is given back (`open_claimed`).
+/// The guards' sets still hold such a block clean until their next look,
+/// so [`publish`] looks at the claim before setting the bit and again
+/// after: a claim made in between is seen the second time and the bit goes
+/// back, and one made after clears it itself. Nobody can see the bit for
+/// that moment: [`publish`] holds the journal's lock throughout.
+///
 /// Who asks the bits holds the journal's lock from before the look until
 /// it has read the journal ([`published`]), and nobody sets a bit without
 /// that lock: a block opened and guarded again between the look and the
@@ -910,9 +928,17 @@ fn publish(_noted: &Journal, written: &[usize], start: usize, end: usize, holes:
     for &page in written {
         let block = page * PAGE / BLOCK;
         // (Not one that a write has opened since the guards were asked,
-        // nor one that could not be made read-only.)
-        if g.clean.contains(&block) {
+        // nor one that could not be made read-only; nor one a fault has
+        // claimed without the guards' lock, which their sets still hold
+        // clean until the next look: [`settle_claims`].)
+        if g.clean.contains(&block) && !CLAIMS.claimed(block) {
             PUBLISHED.set(block);
+            // A fault that claims the block from here on clears the bit
+            // itself, after its claim; one that claimed it since the look
+            // above is seen now ([`PUBLISHED`]).
+            if CLAIMS.claimed(block) {
+                PUBLISHED.clear(block);
+            }
         }
     }
     if !holes {
@@ -1248,6 +1274,17 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             );
         }
     }
+    // The same for the faults taken without the guards' lock.
+    guard_fast_turn();
+    if guard_fast() {
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_multiple_of(65_536) {
+            let [free, locked, shared] = fault_counts();
+            tracing::info!(
+                "write faults on guarded view memory open their block without the guards' lock where they can (VICTORY_GUARD_FAST=1): in the last 65536 askings of the guards {free} faults did, {locked} took the lock and opened theirs, {shared} found theirs opened by another fault"
+            );
+        }
+    }
     written
 }
 
@@ -1276,6 +1313,10 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // What faults opened without the guards' lock is open here too
+    // ([`settle_claims`]); one that claims a block after this is a write
+    // after this asking, seen at the next.
+    settle_claims(&mut g, first, last);
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
@@ -1407,12 +1448,33 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             }
             #[cfg(feature = "diagnostics")]
             ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for &alias in &shown {
+                g.aliased.insert(alias / BLOCK);
+            }
+            // No view of the page is opened without the guards' lock from
+            // here on: a write to one must open them all ([`CLAIMS`]). One
+            // that a fault is opening right now cannot be made read-only
+            // before that fault is done; then no view of the page is left
+            // guarded, and the next asking of each finds it written.
+            if !shown.iter().all(|&alias| alias / BLOCK == block || disarm_alias(g, alias / BLOCK)) {
+                open(g, block * BLOCK, (block + 1) * BLOCK);
+                continue;
+            }
             for alias in shown {
                 let alias = alias / BLOCK;
-                g.aliased.insert(alias);
                 if alias != block {
                     protect_alias(g, alias);
                 }
+            }
+        }
+    }
+    // With [`guard_fast`]: the blocks made read-only and clean here whose
+    // page has no other guarded view are armed, after their views were
+    // looked at (an armed block is in no view's `aliased`).
+    if guard_fast() {
+        for block in from..to {
+            if g.clean.contains(&block) && !g.aliased.contains(&block) {
+                CLAIMS.arm(block);
             }
         }
     }
@@ -1460,6 +1522,18 @@ fn protect_alias(g: &mut Guards, block: usize) {
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    if from >= to {
+        return;
+    }
+    // A block that a fault claimed without the guards' lock, and is giving
+    // the write access back to, is left open ([`CLAIMS`]): that fault's
+    // call could land after ours and leave the block writable, noted
+    // guarded and clean. It is reported written again at the next asking.
+    if let Some(busy) = (from..to).find(|&block| !may_guard(block)) {
+        protect_here(g, from, busy);
+        protect_here(g, busy + 1, to);
+        return;
+    }
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
@@ -1568,6 +1642,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // No fault claims it from here on ([`CLAIMS`]; one that claimed it
+        // already gives the write access back too, which does no harm).
+        disarm(block);
         // Before the block can be written ([`PUBLISHED`]; nothing to do
         // where no bit was ever set).
         PUBLISHED.clear(block);
@@ -1584,7 +1661,14 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    let mut g = guards();
+    open(&mut g, at, end);
+    // And a block a fault claimed without the guards' lock and may not have
+    // opened yet ([`guard_fast`]; the guards may have let go of it already:
+    // [`settle_claims`]).
+    open_opening(&g, at / BLOCK, end.div_ceil(BLOCK));
+    drop(g);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -1805,6 +1889,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // Not guarded by us any more ([`CLAIMS`]).
+        disarm(block);
         // What it shows is new ([`PUBLISHED`]).
         PUBLISHED.clear(block);
     }
@@ -1833,6 +1919,420 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+/// Whether a write fault opens a guarded block without the guards' lock
+/// where it can (`VICTORY_GUARD_FAST=1`; off by default).
+///
+/// Every write fault took the guards' lock (`install`'s handler). So does
+/// every asking of view memory that the light refresh's bits do not
+/// answer, and the submitting thread holds it while it makes the blocks
+/// the title wrote read-only again ([`guard_at`]: a `VirtualProtect` call
+/// for each run of them, which has every processor's address cache
+/// flushed) and while it looks at their other views. It takes the lock
+/// thousands of times a frame, and a fault that waits for it is woken only
+/// to find it taken again. In run M0b (96 ms frames) the title's recording
+/// threads stood 42.65 ms a frame in their faults waiting for it, some 380
+/// faults a frame, about 100 microseconds each, while the faults' own holds
+/// were some 0.3 ms a frame; and the submitting thread waited 7.3 ms a
+/// frame for it in [`writes`] and 2.45 ms in `Tracked::take`.
+///
+/// With the switch a block that [`protect`] made read-only and noted clean,
+/// whose page has no other guarded view, is armed ([`CLAIMS`]). A fault
+/// there claims it in one atomic change, takes its bit of the light
+/// refresh and gives the write access back, with no lock of ours
+/// (`open_claimed`). A fault on a block not armed (yet) spins for a moment
+/// ([`SPIN_US`]) waiting for the lock or for the block to be armed before
+/// it sleeps on the lock: the submitting thread arms a block some
+/// microseconds after making it read-only, and a title thread that writes a
+/// buffer all the time faults in between. Blocks whose page has other
+/// views are opened under the lock as before, all views together.
+///
+/// What changes in the answers: nothing. The claim is made before the
+/// write that faulted goes on and before anything can write the block, and
+/// the next asking of the block finds it open ([`settle_claims`]), as it
+/// finds a block a fault opened under the lock; a claim made while an
+/// asking looks is a write after it, as a fault waiting for the lock was.
+/// The guards' lock holders heed the claims whether the switch is on or
+/// not (where nothing was ever armed that is a load or two), so it may
+/// change at any moment; the tests turn it on for themselves.
+fn guard_fast() -> bool {
+    GUARD_FAST_NOW.load(std::sync::atomic::Ordering::Relaxed) || fast_in_tests()
+}
+
+/// [`guard_fast`] as it is now: a plain load, so that the fault handler
+/// never reads the environment or the clock.
+static GUARD_FAST_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `VICTORY_GUARD_FAST`: 0 off, 1 on, 2 in turn (`alt`: twenty seconds
+/// with, twenty without, each change said in the log, to measure it in one
+/// scene). Read once; `1` turns [`guard_fast`] on here.
+fn guard_fast_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GUARD_FAST").as_deref() {
+        Ok("1") => {
+            GUARD_FAST_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
+            1
+        }
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// With `VICTORY_GUARD_FAST=alt`: the turn the switch is in now, looked at
+/// with every asking of the guards (never in the fault handler).
+fn guard_fast_turn() {
+    if guard_fast_mode() != 2 {
+        return;
+    }
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    if GUARD_FAST_NOW.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+        tracing::info!(
+            "write faults on guarded view memory open their block without the guards' lock from now (VICTORY_GUARD_FAST=alt): {}",
+            if on { "ON" } else { "off, as usual" }
+        );
+    }
+}
+
+/// [`guard_fast`] as a test turns it on (`tests::fast_on`).
+#[cfg(test)]
+fn fast_in_tests() -> bool {
+    tests::FAST.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// [`guard_fast`] as a test turns it on: never outside the tests.
+#[cfg(not(test))]
+const fn fast_in_tests() -> bool {
+    false
+}
+
+/// [`Claims`]: nothing for a fault to do at the block without the lock.
+const UNARMED: u64 = 0;
+/// Read-only by our hand, guarded and clean, and no other view of its page
+/// is guarded: a fault may claim it.
+const ARMED: u64 = 1;
+/// A fault claimed it and is giving its write access back.
+const OPENING: u64 = 2;
+/// A fault claimed it and gave its write access back; the guards' sets
+/// may still hold it as read-only and clean.
+const OPENED: u64 = 3;
+
+/// What a write fault may do at each 64 KiB block without the guards' lock
+/// ([`guard_fast`]): two bits a block, read and changed with no lock, in
+/// pieces made when first needed and never let go, as [`Bits`].
+///
+/// How a block's claim moves. `UNARMED` to `ARMED` under the guards' lock,
+/// by [`protect`] only, right after it made the block read-only and noted
+/// it guarded and clean, and only if no other view of its page is guarded.
+/// `ARMED` to `OPENING` by a write fault that claims it, in one change; that
+/// fault alone moves it on to `OPENED`, once its `VirtualProtect` call has
+/// returned (`open_claimed`). `ARMED` or `OPENED` back to `UNARMED` under
+/// the guards' lock, by whoever takes the block out of their sets or brings
+/// the sets up to date ([`disarm`], [`disarm_alias`], [`settle_claims`],
+/// [`may_guard`]).
+///
+/// What the guards rely on:
+/// - `ARMED`: the block is read-only by our hand, in `protected` and
+///   `clean`, and not in `aliased`. Whoever takes it out of `protected` or
+///   `clean`, or puts it in `aliased`, disarms it first, under the lock;
+///   only [`protect`] arms, under the lock. So a block not in `protected`
+///   cannot be claimed while the lock is held.
+/// - `OPENING`: the claiming fault's call to give the write access back may
+///   not have returned. Nobody makes such a block read-only: that call
+///   could land after ours and leave the block writable, noted guarded and
+///   clean, its writes unseen for good. [`protect_here`] leaves it open and
+///   [`protect`] guards no view of its page. Who needs it writable now (a
+///   second fault there, [`writing`]) gives the write access back itself
+///   under the guards' lock (`open_opening`); a fault without the lock
+///   waits a millisecond at most (`wait_opening`). Nobody waits for a fault
+///   that may have stopped.
+/// - `OPENING` or `OPENED` (claimed): the block was written, or is about to
+///   be, since it was armed, though `protected` and `clean` may still hold
+///   it. Whoever believes those sets about a block settles its claim first
+///   ([`settle_claims`]), or does not mind (`known_view` asks whether the
+///   block is view memory, which it still is).
+static CLAIMS: Claims = Claims::new();
+
+struct Claims([std::sync::atomic::AtomicPtr<ClaimsPiece>; BITS_PIECES]);
+
+/// The claims of 4 GiB: 65,536 blocks, 32 to a word.
+type ClaimsPiece = [std::sync::atomic::AtomicU64; 2 * BITS_WORDS];
+
+/// The blocks of a piece of [`Claims`] (and of [`Bits`]).
+const PIECE_BLOCKS: usize = 64 * BITS_WORDS;
+
+impl Claims {
+    const fn new() -> Claims {
+        Claims([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; BITS_PIECES])
+    }
+
+    /// The word that holds `block`'s claim and the claim's place in it, if
+    /// its piece was ever made.
+    fn word(&self, block: usize) -> Option<(&std::sync::atomic::AtomicU64, u32)> {
+        let piece = self.0.get(block / PIECE_BLOCKS)?.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: null, or a piece made by `arm`, which is never freed.
+        let piece = unsafe { piece.as_ref() }?;
+        Some((&piece[(block % PIECE_BLOCKS) / 32], ((block % 32) * 2) as u32))
+    }
+
+    /// `block`'s claim (`UNARMED` where none was ever armed).
+    fn get(&self, block: usize) -> u64 {
+        self.word(block)
+            .map_or(UNARMED, |(word, at)| (word.load(std::sync::atomic::Ordering::SeqCst) >> at) & 3)
+    }
+
+    /// Moves `block`'s claim from `from` to `to` if it is `from` now, in one
+    /// change; whether it did. (Never from `UNARMED` where no piece was
+    /// made: [`Claims::arm`] makes it.)
+    fn swap(&self, block: usize, from: u64, to: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some((word, at)) = self.word(block) else {
+            return false;
+        };
+        word.fetch_update(SeqCst, SeqCst, |w| (((w >> at) & 3) == from).then_some((w & !(3 << at)) | (to << at)))
+            .is_ok()
+    }
+
+    /// Arms `block` if it is `UNARMED`, making its piece if needed (with the
+    /// guards' lock: not in the fault handler, which never allocates here).
+    /// Nothing past the address space.
+    fn arm(&self, block: usize) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let Some(place) = self.0.get(block / PIECE_BLOCKS) else {
+            return;
+        };
+        if place.load(Acquire).is_null() {
+            let made: *mut ClaimsPiece =
+                Box::into_raw(Box::new([const { std::sync::atomic::AtomicU64::new(0) }; 2 * BITS_WORDS]));
+            if place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire).is_err() {
+                // SAFETY: made above and shown to nobody: another thread's
+                // piece is in the place.
+                drop(unsafe { Box::from_raw(made) });
+            }
+        }
+        self.swap(block, UNARMED, ARMED);
+    }
+
+    /// Whether a fault claimed `block` and the guards have not settled it
+    /// (`OPENING` or `OPENED`).
+    fn claimed(&self, block: usize) -> bool {
+        self.get(block) & OPENING != 0
+    }
+
+    /// The claimed blocks of `[first, last)`, in order: a load for every 32
+    /// blocks of pieces that were made, one for every 65,536 of the others.
+    fn claimed_in(&self, first: usize, last: usize) -> Vec<usize> {
+        /// The high bit of every claim in a word: set for `OPENING` and
+        /// `OPENED`.
+        const HIGH: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        let mut out = Vec::new();
+        let last = last.min(BITS_PIECES * PIECE_BLOCKS);
+        let mut block = first;
+        while block < last {
+            let Some((word, _)) = self.word(block) else {
+                block = (block / PIECE_BLOCKS + 1) * PIECE_BLOCKS;
+                continue;
+            };
+            let until = ((block / 32 + 1) * 32).min(last);
+            // The claims of blocks `[block, until)` in their word.
+            let mask = (u64::MAX >> (64 - 2 * (until - block))) << ((block % 32) * 2);
+            let mut high = word.load(std::sync::atomic::Ordering::SeqCst) & mask & HIGH;
+            while high != 0 {
+                out.push((block / 32) * 32 + high.trailing_zeros() as usize / 2);
+                high &= high - 1;
+            }
+            block = until;
+        }
+        out
+    }
+}
+
+/// Brings what the guards hold of blocks `[first, last)` up to date with
+/// the faults that claimed blocks there without their lock ([`CLAIMS`]):
+/// such a block was written, or is about to be, and is read-only by our
+/// hand no more. Its claim ends here if its fault is done; one that is
+/// still giving the write access back keeps it, and is not made read-only
+/// meanwhile ([`protect_here`]). With the guards' lock, before what they
+/// hold of the range is believed.
+fn settle_claims(g: &mut Guards, first: usize, last: usize) {
+    for block in CLAIMS.claimed_in(first, last) {
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+        CLAIMS.swap(block, OPENED, UNARMED);
+    }
+}
+
+/// `block` leaves the guards' sets (opened, or shown anew), with their
+/// lock: no fault claims it from here on. A claim under way keeps its
+/// state until its fault is done (only that fault leaves `OPENING`).
+fn disarm(block: usize) {
+    if !CLAIMS.swap(block, ARMED, UNARMED) {
+        CLAIMS.swap(block, OPENED, UNARMED);
+    }
+}
+
+/// `block` is another view of a page [`protect`] is guarding, and goes in
+/// `aliased`: no fault opens it without the guards' lock from here on (a
+/// write there must open every view). One that a fault opened so leaves
+/// the guards' sets, to be made read-only again as the other views are
+/// (`protect_alias`). False if a fault is giving its write access back
+/// right now: it cannot be made read-only yet.
+fn disarm_alias(g: &mut Guards, block: usize) -> bool {
+    if CLAIMS.swap(block, ARMED, UNARMED) {
+        return true;
+    }
+    if CLAIMS.claimed(block) {
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+    }
+    may_guard(block)
+}
+
+/// Whether `block`, which is not in the guards' sets, may be made read-only
+/// as far as the claims say: no fault is giving its write access back. A
+/// claim whose fault is done ends here. With the guards' lock (so no new
+/// claim comes: the block is not armed).
+fn may_guard(block: usize) -> bool {
+    CLAIMS.swap(block, OPENED, UNARMED);
+    CLAIMS.get(block) == UNARMED
+}
+
+/// A write fault's claim of `block` ([`CLAIMS`]), with no lock: `ARMED` to
+/// `OPENING` in one change, then the block's bit of the light refresh goes
+/// and its write access comes back (in that order, as in `open_here`),
+/// then `OPENED`. False, and nothing done, if the block was not armed.
+fn open_claimed(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if !CLAIMS.swap(block, ARMED, OPENING) {
+        return false;
+    }
+    // Before the block can be written ([`PUBLISHED`]).
+    PUBLISHED.clear(block);
+    let mut old = 0;
+    // SAFETY: a block we made read-only. This fault claimed it, and nobody
+    // makes it read-only again before the claim is `OPENED`.
+    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    // (Only the fault that claimed the block leaves `OPENING`.)
+    CLAIMS.swap(block, OPENING, OPENED);
+    true
+}
+
+/// Waits, a millisecond at most, while a fault that claimed `block` gives
+/// its write access back (one `VirtualProtect` call, which waits for no
+/// lock of ours); whether that is done.
+fn wait_opening(block: usize) -> bool {
+    let mut since: Option<std::time::Instant> = None;
+    let mut spins = 0u32;
+    while CLAIMS.get(block) == OPENING {
+        spins = spins.saturating_add(1);
+        if spins < 1024 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if since.get_or_insert_with(std::time::Instant::now).elapsed().as_micros() >= 1000 {
+            return false;
+        }
+        std::thread::yield_now();
+    }
+    true
+}
+
+/// Gives the write access back to the blocks of `[first, last)` that a
+/// fault claimed without the guards' lock and may not have opened yet
+/// (`OPENING`), as that fault itself will. With the guards' lock
+/// (`_held`): such a block is made read-only only under it, after its
+/// fault is done, so whichever of the two calls lands last leaves it
+/// writable, and nobody waits for a fault that may have stopped.
+fn open_opening(_held: &Guards, first: usize, last: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    for block in CLAIMS.claimed_in(first, last) {
+        if CLAIMS.get(block) == OPENING {
+            let mut old = 0;
+            // SAFETY: a block we made read-only, which a fault claimed.
+            unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        }
+    }
+}
+
+/// How long a write fault on a block that is not armed spins for the
+/// guards' lock, or for the block to be armed, before it sleeps on the
+/// lock ([`guard_fast`]), in microseconds. A sleeper is woken only to find
+/// the lock taken again as often as not (100 microseconds a fault in run
+/// M0b); the submitting thread arms a block a few microseconds after making
+/// it read-only, a few more for each block of the run.
+const SPIN_US: u128 = 20;
+
+/// Since they were last taken ([`fault_counts`]), with [`guard_fast`]:
+/// write faults that claimed their block without the guards' lock, faults
+/// that took the lock and opened their block, and faults that found their
+/// block claimed by another fault.
+static FAULTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`FAULTS`], taken.
+fn fault_counts() -> [u64; 3] {
+    [0, 1, 2].map(|i| FAULTS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// What the write fault at `at` can do without the guards' lock
+/// ([`guard_fast`]). `Ok`: the write can go on (this fault claimed the
+/// block, or another fault did); `Err`: the guards' lock, taken, for the
+/// way as before. Allocates nothing.
+fn fault_fast(at: usize) -> Result<(), std::sync::MutexGuard<'static, Guards>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let block = at / BLOCK;
+    let mut spun: Option<std::time::Instant> = None;
+    let mut spins = 0u32;
+    loop {
+        match CLAIMS.get(block) {
+            ARMED => {
+                if open_claimed(block) {
+                    FAULTS[0].fetch_add(1, Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                    crate::framelog::add(crate::framelog::T::GuardFaults, 1);
+                    return Ok(());
+                }
+                // Claimed by another fault first, or let go under the lock:
+                // looked at again.
+                continue;
+            }
+            // Another fault claimed it: the write access is back in a moment
+            // (or, if that fault stopped, under the lock: `open_opening`).
+            OPENING => {
+                if wait_opening(block) {
+                    FAULTS[2].fetch_add(1, Relaxed);
+                    return Ok(());
+                }
+                return Err(guards());
+            }
+            // Another fault gave the write access back. (If that failed, as
+            // where the block was unmapped since, the lock's way decides.)
+            OPENED => {
+                if writable(at) {
+                    FAULTS[2].fetch_add(1, Relaxed);
+                    return Ok(());
+                }
+                return Err(guards());
+            }
+            _ => {}
+        }
+        // (The lock at every fourth turn only: a try that fails still takes
+        // the lock's cache line from its holder, who reads the sets beside
+        // it.)
+        if spins.is_multiple_of(4) {
+            match GUARDS.try_lock() {
+                Ok(g) => return Err(g),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Err(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+        spins = spins.wrapping_add(1);
+        if spins.is_multiple_of(16) && spun.get_or_insert_with(std::time::Instant::now).elapsed().as_micros() >= SPIN_US {
+            return Err(guards());
+        }
+        std::hint::spin_loop();
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -1852,14 +2352,36 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        // Without the guards' lock where that can be done ([`guard_fast`]);
+        // otherwise with it, as before.
+        let fast = guard_fast();
+        let mut g = if fast {
+            match fault_fast(at) {
+                Ok(()) => return EXCEPTION_CONTINUE_EXECUTION,
+                Err(g) => g,
+            }
+        } else {
+            guards()
+        };
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
         if open(&mut g, at, at + 1) {
+            if fast {
+                FAULTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // A fault that claimed the block without the lock is giving its
+        // write access back, and the guards may have let go of the block
+        // already ([`settle_claims`]): it is given back here too, and this
+        // write goes on. (Whether the switch is on now or not:
+        // [`guard_fast`].)
+        if CLAIMS.get(at / BLOCK) == OPENING {
+            open_opening(&g, at / BLOCK, at / BLOCK + 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
@@ -1870,8 +2392,9 @@ fn install() {
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // The switch is read here, not first in the handler ([`open`] asks
-    // it): reading the environment allocates.
+    // it): reading the environment allocates. So is the handler's own.
     light_kept();
+    guard_fast_mode();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
@@ -2801,6 +3324,262 @@ mod tests {
         BITS.set(1 << 40);
         BITS.clear(1 << 40);
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+
+    /// [`guard_fast`] for the tests that turn it on ([`fast_on`]).
+    pub(super) static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// [`guard_fast`] on until dropped, in turn with the light refresh's
+    /// tests (the other tests may run meanwhile: their answers are the same
+    /// with it, and it may change at any moment).
+    struct FastOn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for FastOn {
+        fn drop(&mut self) {
+            FAST.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn fast_on() -> FastOn {
+        let turn = light_turn();
+        FAST.store(true, std::sync::atomic::Ordering::SeqCst);
+        FastOn(turn)
+    }
+
+    /// A pagefile section of `bytes` mapped once, told to the census as the
+    /// runtime does; the section handle and the view.
+    fn one_view(bytes: usize) -> (usize, usize) {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::CreateFileMappingW;
+        // SAFETY: a fresh pagefile section; the caller closes the handle.
+        let section = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, bytes as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        (section as usize, another_view(section as usize, bytes))
+    }
+
+    /// One more view of all of `section`, told to the census as the runtime
+    /// does (after which the guards open the pages' other views).
+    fn another_view(section: usize, bytes: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a section of `bytes` made by `one_view`; the view keeps it.
+        let view = unsafe { MapViewOfFile(section as *mut std::ffi::c_void, FILE_MAP_WRITE, 0, 0, bytes).Value as usize };
+        assert_ne!(view, 0);
+        crate::inplace::title_memory_view(view, bytes, section, 0);
+        view
+    }
+
+    /// A block's claims go as [`Claims`] says, each by itself, whatever lies
+    /// beside it; the claimed ones of a range are found in order.
+    #[test]
+    fn claims_of_blocks() {
+        static C: Claims = Claims::new();
+        let blocks = [0usize, 1, 31, 32, 33, 65535, 65536, 65537, (1 << 31) - 1];
+        for &b in &blocks {
+            assert_eq!(C.get(b), UNARMED);
+            assert!(!C.swap(b, ARMED, OPENING), "nothing armed to claim");
+            C.arm(b);
+            assert_eq!(C.get(b), ARMED);
+            assert!(!C.claimed(b));
+        }
+        assert!([2, 30, 34, 65534, 65538].iter().all(|&b| C.get(b) == UNARMED), "the neighbours are untouched");
+        // A claim is made once, and only the claimer moves it on.
+        assert!(C.swap(32, ARMED, OPENING));
+        assert!(!C.swap(32, ARMED, OPENING), "claimed once");
+        C.arm(32);
+        assert_eq!(C.get(32), OPENING, "a claim is not armed over");
+        assert!(C.claimed(32) && C.get(31) == ARMED && C.get(33) == ARMED);
+        assert!(C.swap(32, OPENING, OPENED));
+        assert!(C.claimed(32));
+        assert!(C.swap(65536, ARMED, OPENING));
+        assert_eq!(C.claimed_in(0, 1 << 31), [32, 65536]);
+        assert!(C.claimed_in(33, 65536).is_empty());
+        assert_eq!(C.claimed_in(32, 33), [32]);
+        assert_eq!(C.claimed_in(65535, 65537), [65536]);
+        assert!(C.claimed_in(5, 5).is_empty() && C.claimed_in(40, 30).is_empty());
+        // Many in a word, and a range that begins and ends inside words.
+        for b in 100..164 {
+            C.arm(b);
+            assert!(C.swap(b, ARMED, OPENING));
+        }
+        assert_eq!(C.claimed_in(90, 200), (100..164).collect::<Vec<_>>());
+        assert_eq!(C.claimed_in(101, 163), (101..163).collect::<Vec<_>>());
+        assert_eq!(C.claimed_in(0, 101), [32, 100]);
+        // Settled.
+        assert!(C.swap(32, OPENED, UNARMED));
+        assert_eq!(C.get(32), UNARMED);
+        assert_eq!(C.claimed_in(0, 100), Vec::<usize>::new());
+        // Past the address space: nothing armed, nothing found, no end of
+        // looking.
+        C.arm(1 << 40);
+        assert_eq!(C.get(1 << 40), UNARMED);
+        assert!(C.claimed_in((1 << 31) - 1, usize::MAX).is_empty());
+    }
+
+    /// With [`guard_fast`]: a write to a block guarded and armed goes on
+    /// while another thread holds the guards' lock, and is reported by the
+    /// next asking, which guards and arms the block again.
+    #[test]
+    fn a_fault_opens_an_armed_block_without_the_guards_lock() {
+        let _fast = fast_on();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, view) = one_view(SIZE);
+        let (b0, b1) = (view / BLOCK, view / BLOCK + 1);
+        let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1)]));
+        assert_eq!([CLAIMS.get(b0), CLAIMS.get(b1)], [ARMED, ARMED]);
+        let held = guards();
+        let (done, wait) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            // SAFETY: the second block of the view, read-write once the
+            // handler has opened it.
+            unsafe { ((view + BLOCK + 8) as *mut u8).write_volatile(1) };
+            done.send(()).unwrap();
+        });
+        let went_on = wait.recv_timeout(std::time::Duration::from_secs(20));
+        let sets_said = (held.protected.contains(&b1), held.clean.contains(&b1));
+        drop(held);
+        writer.join().unwrap();
+        assert!(went_on.is_ok(), "the write waited for the guards' lock");
+        assert_eq!(sets_said, (true, true), "the sets catch up at the next look");
+        assert_eq!([CLAIMS.get(b0), CLAIMS.get(b1)], [ARMED, OPENED]);
+        assert!(!clean(b1) && clean(b0));
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(1)]), "the write is reported");
+        assert_eq!(CLAIMS.get(b1), ARMED, "guarded and armed again");
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
+        // A write of ours told of (`writing`) takes the block under the lock.
+        writing(view + 8, 8);
+        assert_eq!(CLAIMS.get(b0), UNARMED);
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0)]));
+        assert_eq!(CLAIMS.get(b0), ARMED);
+        drop_views(section, &[view], SIZE);
+        assert_eq!([CLAIMS.get(b0), CLAIMS.get(b1)], [UNARMED, UNARMED], "unmapped: let go");
+    }
+
+    /// With [`guard_fast`]: a block whose fault has not given its write
+    /// access back yet is reported written and left open, not made
+    /// read-only under that fault; once the fault is done the next asking
+    /// guards it.
+    #[test]
+    fn a_block_a_fault_is_still_opening_is_not_guarded_again() {
+        use windows_sys::Win32::System::Memory::VirtualProtect;
+        let _fast = fast_on();
+        let (section, view) = one_view(BLOCK);
+        let block = view / BLOCK;
+        assert_eq!(guard(view, view + BLOCK), Some(vec![view / PAGE]));
+        // A fault's claim, as `open_claimed` makes it, stopped before its
+        // call to give the write access back.
+        assert!(CLAIMS.swap(block, ARMED, OPENING));
+        assert_eq!(guard(view, view + BLOCK), Some(vec![view / PAGE]), "claimed: written");
+        assert_eq!(CLAIMS.get(block), OPENING);
+        assert!(!guards().protected.contains(&block), "left open");
+        // The fault goes on.
+        let mut old = 0;
+        // SAFETY: our view; only its protection changes.
+        assert_ne!(unsafe { VirtualProtect(view as *const _, BLOCK, PAGE_READWRITE, &mut old) }, 0);
+        assert!(CLAIMS.swap(block, OPENING, OPENED));
+        assert_eq!(guard(view, view + BLOCK), Some(vec![view / PAGE]), "open since: written again");
+        assert_eq!(CLAIMS.get(block), ARMED, "and guarded now");
+        assert_eq!(guard(view, view + BLOCK), Some(Vec::new()));
+        // A real write finds it guarded.
+        // SAFETY: our view, opened by the handler.
+        unsafe { (view as *mut u8).write_volatile(1) };
+        assert_eq!(CLAIMS.get(block), OPENED);
+        assert_eq!(guard(view, view + BLOCK), Some(vec![view / PAGE]));
+        drop_views(section, &[view], BLOCK);
+    }
+
+    /// With [`guard_fast`]: a block an asking guarded, and a fault claimed
+    /// before the asking set the bits of the light refresh, gets no bit;
+    /// the next asking goes to the guards and reports it.
+    #[test]
+    fn a_block_claimed_before_its_bit_is_set_gets_none() {
+        let _fast = fast_on();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, view) = one_view(SIZE);
+        let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        let (first, _) = writes_as(view, view + SIZE, true, 2).expect("a view");
+        assert!(known(view, view + SIZE));
+        // A fault takes the bit.
+        // SAFETY: the view's first block, opened by the handler.
+        unsafe { (view as *mut u8).write_volatile(1) };
+        assert!(!known(view, view + BLOCK) && known(view + BLOCK, view + SIZE));
+        // An asking guards and arms the block again; before it sets the
+        // bit, a fault claims the block.
+        let written = guard(view, view + SIZE).expect("a view");
+        assert_eq!(written, [pages(0)]);
+        assert!(open_claimed(view / BLOCK));
+        publish(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), &written, view, view + SIZE, false);
+        assert!(!known(view, view + BLOCK), "claimed: no bit");
+        let before = light_counts();
+        let (second, written) = writes_as(view, view + SIZE, true, 2).expect("a view");
+        assert_eq!(since(first, written), [pages(0)]);
+        assert_eq!(light_counts(), [before[0], before[1] + 1], "the guards were asked");
+        assert!(known(view, view + SIZE));
+        let (_, written) = writes_as(view, view + SIZE, true, 2).expect("a view");
+        assert!(since(second, written).is_empty());
+        drop_views(section, &[view], SIZE);
+    }
+
+    /// With [`guard_fast`]: no view of a page shown at two addresses is
+    /// armed, and a write through one is reported at the other as before.
+    /// A block armed while its page had one view is let go when another
+    /// view is mapped.
+    #[test]
+    fn views_of_one_page_are_not_armed() {
+        let _fast = fast_on();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one) = one_view(SIZE);
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(CLAIMS.get(one / BLOCK), ARMED);
+        let two = another_view(section, SIZE);
+        assert_eq!([CLAIMS.get(one / BLOCK), CLAIMS.get(one / BLOCK + 1)], [UNARMED, UNARMED], "opened: a writable view of the pages");
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0), pages(two, 1)]));
+        for view in [one, two] {
+            assert_eq!([CLAIMS.get(view / BLOCK), CLAIMS.get(view / BLOCK + 1)], [UNARMED, UNARMED]);
+        }
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((two + BLOCK + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 1)]));
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// With [`guard_fast`]: a page one view of which a fault is still
+    /// opening is not guarded at its other view either (a write through the
+    /// first would go unseen there); once the fault is done both are, and a
+    /// write through one is reported at the other.
+    #[test]
+    fn a_page_whose_other_view_a_fault_is_opening_is_left_unguarded() {
+        let _fast = fast_on();
+        let (section, one) = one_view(BLOCK);
+        let (b1, page1) = (one / BLOCK, one / PAGE);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page1]));
+        // A fault's claim, stopped before its call to give the access back.
+        assert!(CLAIMS.swap(b1, ARMED, OPENING));
+        // Another view of the page: the guard over the first is opened, and
+        // the claim stays.
+        let two = another_view(section, BLOCK);
+        let (b2, page2) = (two / BLOCK, two / PAGE);
+        assert_eq!(CLAIMS.get(b1), OPENING);
+        assert_eq!(guard(two, two + BLOCK), Some(vec![page2]));
+        {
+            let g = guards();
+            assert!(!g.protected.contains(&b1) && !g.protected.contains(&b2), "no view of the page guarded");
+        }
+        // The fault goes on.
+        assert!(CLAIMS.swap(b1, OPENING, OPENED));
+        assert_eq!(guard(two, two + BLOCK), Some(vec![page2]), "open since: written again");
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page1]));
+        assert_eq!([CLAIMS.get(b1), CLAIMS.get(b2)], [UNARMED, UNARMED], "views of one page");
+        assert_eq!(guard(two, two + BLOCK), Some(Vec::new()));
+        // SAFETY: the first view, read-write once the handler has opened it.
+        unsafe { (one as *mut u8).write_volatile(1) };
+        assert_eq!(guard(two, two + BLOCK), Some(vec![page2]), "written through the other view");
+        drop_views(section, &[one, two], BLOCK);
     }
 }
 
