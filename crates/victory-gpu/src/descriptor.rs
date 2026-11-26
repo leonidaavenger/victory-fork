@@ -139,6 +139,21 @@ static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLo
 #[cfg(windows)]
 static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Whether title memory `[at, at + len)` holds bytes of a shader-visible
+/// heap's records: what [`sync_heaps`] reads (`crate::host`'s
+/// `VICTORY_HEAP_SYNC_BESIDE` waits for the pass before a step of ours
+/// writes there). While a pass runs it holds the list of heaps, so none is
+/// made or dropped then, and this answers of the heaps it reads.
+#[cfg(windows)]
+pub(crate) fn in_shader_heaps(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at.saturating_add(len) as u64);
+    SHADER_HEAPS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(start, end, _)| from < end && start < to)
+}
+
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {

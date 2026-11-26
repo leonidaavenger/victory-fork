@@ -7000,8 +7000,12 @@ impl Host {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted. (With
+        // [`heap_sync_beside`]: on a helper, given to it further down.)
+        let beside = heap_sync_beside() && crate::crew::ready();
+        if !beside {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -7022,6 +7026,15 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        // The pass over the view heaps beside what follows, waited for at
+        // the latest when the refreshes are done; the slots it finds
+        // waiting for a texture made since are made then
+        // ([`Batch::heaps_done`]).
+        let heaps = beside.then(|| {
+            let heaps = crate::crew::group();
+            heaps.spawn(crate::descriptor::sync_heaps);
+            heaps
+        });
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -7033,7 +7046,10 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            heaps,
+            ..Batch::default()
+        };
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -7087,6 +7103,10 @@ impl Host {
         batch.flush();
         crate::watch::ask_once_end();
         part = prep_part(2, part);
+        // The pass over the view heaps, if it ran beside: done before the
+        // lists that index the slots go to the card (its wait, if any, is
+        // the next part's).
+        batch.heaps_done();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -8888,6 +8908,23 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    // Into a view heap the pass beside may still read: the
+                    // pass first, as without [`heap_sync_beside`]. (A pass
+                    // done already is waited for here at no cost, and the
+                    // heaps are not looked at again in this submission.)
+                    // shortcut: a heap the title makes after this look and
+                    // before the pass begins, over memory this copy
+                    // writes, is read by the pass after the copy; no list
+                    // of this submission names a heap made after it was
+                    // submitted.
+                    if let Some(heaps) = &batch.heaps
+                        && (heaps.done() || crate::descriptor::in_shader_heaps(dst, len))
+                    {
+                        if !heaps.done() {
+                            HEAPS_WAITED[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                        batch.heaps_done();
+                    }
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
@@ -8921,6 +8958,14 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
+                        // It may write title memory anywhere, a view heap
+                        // too: the pass beside first ([`heap_sync_beside`]).
+                        if let Some(heaps) = &batch.heaps {
+                            if !heaps.done() {
+                                HEAPS_WAITED[2].fetch_add(1, Ordering::Relaxed);
+                            }
+                            batch.heaps_done();
+                        }
                         batch.title_written();
                     }
                     work();
@@ -9008,6 +9053,145 @@ fn wide_refresh() -> bool {
     }
 }
 
+/// Whether a flush's copies of title memory are made in pieces of at most
+/// [`PIECE_BYTES`] by the crew of helpers and the submitting thread, while
+/// the submitting thread goes on finding what the flush's next copies
+/// must take (`VICTORY_REFRESH_PIECES=1`; `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log). Off by default.
+///
+/// Why: profile M12 has 23.6 ms a frame of the submitting thread in
+/// [`Batch::flush`], 13.0 ms of it the copies themselves (`copy_changed`
+/// 7.9: read title memory, compare with the copy's CPU side, store what
+/// differs; `copy_mapped` 5.1), about 105 MB a frame, all on one thread;
+/// the rest is the asking which pages are new (`watch::writes` 6.0,
+/// `nothing_new` 2.1), which stays on the submitting thread, behind the
+/// write-watch journal's one lock. `VICTORY_WIDE_REFRESH` gives each copy
+/// to a helper whole, so the 174 MB buffer refreshed at every submission
+/// and the other big ones stay one thread's (-2.5 ms a frame measured).
+///
+/// With the switch each refresh of a flush is decided as before
+/// (`Shadow::update_later`: the same asking, the same pages noted taken),
+/// and the copies it decides on are cut at multiples of [`PIECE_BYTES`]
+/// of title memory and put together into pieces of work of at most that
+/// much. While a flush has less than [`CREW_FROM`] bytes to copy they wait
+/// and are made at its end on the submitting thread; from there on they go
+/// to the crew (`crate::crew`) as they are made, and at the flush's end
+/// the submitting thread makes what no helper has taken and waits for the
+/// rest. The flush returns only when every copy is made: the steps after
+/// it (a title copy, a range given to shaders, the lists sent to the
+/// card) find the copies as before. Each byte of a copy is written by one
+/// piece; the card's changed ranges a piece notes are joined with the
+/// others' when they are taken (`shadow::card_dirty`). Safe to change at
+/// any moment: each flush is one way or the other, and done when it
+/// returns. The frame line's copies are the submitting thread's time in
+/// the flush; the per-range times (`copystat::range`) are of the deciding.
+fn refresh_pieces() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_PIECES").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a flush's copies are made in pieces by the crew of helpers from now (VICTORY_REFRESH_PIECES=alt): {}",
+                    if on { "ON" } else { "off, one after the other as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The most bytes of title memory a piece of work of [`refresh_pieces`]
+/// copies, and the line copies are cut at: a piece is about 50-100
+/// microseconds of one thread (a fast core reads and compares some 8-10 GB
+/// a second), so the last one a flush waits for is short, and the
+/// thread-local buffer `Shadow::copy_changed` reads into stays this small
+/// (a whole run of the 174 MB buffer could make it that big).
+const PIECE_BYTES: usize = 512 << 10;
+
+/// The bytes a flush must have to copy before [`refresh_pieces`] gives
+/// its pieces to the crew, one full piece: below it the copies are made on
+/// the submitting thread at the flush's end (most flushes copy little or
+/// nothing, and a helper's wake and the hand-over cost more than such a
+/// copy). From one piece on the copies overlap with the deciding of the
+/// flush's next refreshes; a piece no helper has taken when the flush ends
+/// is made by the submitting thread itself, as it would have been.
+const CREW_FROM: usize = PIECE_BYTES;
+
+/// Whether the pass over the title's view heaps (`descriptor::sync_heaps`)
+/// runs on a helper of the crew beside the rest of the submission's
+/// preparing, instead of on the submitting thread before it
+/// (`VICTORY_HEAP_SYNC_BESIDE=1`; `alt`: twenty seconds with, twenty
+/// without, in turn, each change said in the log). Off by default.
+///
+/// Why: the pass is 7.7 ms a frame of the submitting thread in profile M12
+/// (`HostHeap::mirror` 5.1 for about 10,000 records a frame, the write
+/// tracking's asking 0.8, the pages' reads 0.5, the walk of their records
+/// 1.3), and nothing else the preparing does reads what it makes: host
+/// descriptor slots, read when the lists run. The write-watch asking, the
+/// lists' steps and the refreshes take 25 to 30 ms a frame beside it.
+///
+/// With the switch the pass is given to the crew a little after where it
+/// ran, once the settles, the once-a-second sweep and the making of the
+/// slots that waited for a texture (`descriptor::make_waiting`) are done,
+/// so that none of them runs beside it; and it is waited for before the
+/// lists go to the card, at the latest when the refreshes are done. What
+/// changes, and why it is right:
+/// - It also comes before every step of the submission that writes title
+///   memory into a shader-visible heap: a title copy into one, and any
+///   step whose writes are not known (`Step::Run`, the title's copies of
+///   memory to memory) wait for the pass first. So what our own steps
+///   write into a heap is seen by the next submission's pass, as before.
+/// - What the title's threads write into a heap while the pass runs, it
+///   may see: as before, a little later. Those writes are for lists
+///   submitted after this one (a slot this submission's lists read is not
+///   rewritten before the title knows they ran, and it cannot know yet).
+/// - The slots it finds waiting for a texture made since are made after
+///   the wait (`make_waiting` again), before the lists go to the card, as
+///   the `make_waiting` after it made them before.
+/// - Old resources it lets go of wait for this submission too
+///   (`retire`): it may run after this submission counts as started.
+/// - It holds the write-watch journal's lock while it asks which heap
+///   pages changed (0.8 ms a frame), which the refreshes then wait for.
+///
+/// Nothing it calls submits a list or takes the submission lock, which the
+/// submitting thread holds while it waits for it. Safe to change at any
+/// moment: each submission waits for the pass it gave to the crew, and
+/// only for that. Not without helpers: then the pass runs where it did.
+fn heap_sync_beside() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_BESIDE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heaps runs on a helper beside the preparing from now (VICTORY_HEAP_SYNC_BESIDE=alt): {}",
+                    if on { "ON" } else { "off, on the submitting thread before it as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// Whether a range of a host copy brought up to date in a submission is
 /// left alone for the rest of that submission, until a step of ours writes
 /// title memory there (`VICTORY_REFRESH_ONCE=1`; off by default). After
@@ -9079,9 +9263,28 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`heap_sync_beside`]: the pass over the view heaps, running on
+    /// the crew until it is waited for ([`Batch::heaps_done`]).
+    heaps: Option<crate::crew::Group>,
 }
 
 impl Batch {
+    /// With [`heap_sync_beside`]: waits for the pass over the view heaps
+    /// given to the crew, if it is still to be waited for, and makes the
+    /// slots it found waiting for a texture made since
+    /// (`descriptor::make_waiting`). Before a step that writes title memory
+    /// into a heap, and before the lists go to the card.
+    fn heaps_done(&mut self) {
+        let Some(heaps) = self.heaps.take() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        heaps.wait();
+        HEAPS_WAITED[0].fetch_add(1, Ordering::Relaxed);
+        HEAPS_WAITED[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::descriptor::make_waiting();
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -9121,7 +9324,11 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        if refresh_pieces() {
+            Self::update_in_pieces(&shadow, from, to);
+        } else {
+            Self::update(&shadow, from, to);
+        }
         Self::brought(&mut self.current, &shadow, from, to);
     }
 
@@ -9156,6 +9363,49 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         preparing(0, us);
         preparing(1, copied as u64);
+    }
+
+    /// [`Batch::update`] with [`refresh_pieces`]: the copies of a big
+    /// refresh in pieces, as a flush makes them ([`Batch::flush_pieces`]).
+    fn update_in_pieces(shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let mut later = crate::shadow::Later::default();
+        let copied = shadow.update_later(from, to - from, &mut later);
+        let mut pieces = Pieces::default();
+        pieces.add(&mut later.copies);
+        pieces.finish();
+        later.check();
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        preparing(0, us);
+        preparing(1, copied as u64);
+    }
+
+    /// [`Batch::flush`]'s refreshes with [`refresh_pieces`]: each decided
+    /// in order on this thread, its copies handed to [`Pieces`] as they are
+    /// found, all of them made before this returns.
+    fn flush_pieces(&mut self) {
+        if self.refreshes.is_empty() {
+            return;
+        }
+        let mut pieces = Pieces::default();
+        let mut later = crate::shadow::Later::default();
+        for (shadow, from, to) in self.refreshes.drain(..) {
+            let started = std::time::Instant::now();
+            let copied = shadow.update_later(from, to - from, &mut later);
+            pieces.add(&mut later.copies);
+            let us = started.elapsed().as_micros() as u64;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::range(from, to - from, us, 0);
+            preparing(0, us);
+            preparing(1, copied as u64);
+            Self::brought(&mut self.current, &shadow, from, to);
+        }
+        let started = std::time::Instant::now();
+        pieces.finish();
+        later.check();
+        preparing(0, started.elapsed().as_micros() as u64);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -9212,7 +9462,9 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if refresh_pieces() {
+            self.flush_pieces();
+        } else if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -9241,6 +9493,241 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+    }
+}
+
+/// Since the frame line last took them, with [`heap_sync_beside`]: passes
+/// over the view heaps waited for, the microseconds the submitting thread
+/// stood in those waits (the pass's own time if no helper had taken it
+/// yet), and of the waits the ones a step that writes title memory into a
+/// heap, or may, made early.
+static HEAPS_WAITED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// With the frame line: what the crew did (`crate::crew::line`), and with
+/// [`heap_sync_beside`] the waits for the passes over the view heaps.
+fn crew_line(frames: f64) {
+    crate::crew::line(frames);
+    let [waits, us, early] = [0, 1, 2].map(|i| HEAPS_WAITED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if waits > 0.0 {
+        tracing::info!(
+            "passes over the view heaps beside the preparing per frame (VICTORY_HEAP_SYNC_BESIDE): {waits:.1} waited for, {early:.1} of them early (a step of ours writes title memory into a heap, or may), the submitting thread stood {:.2} ms in the waits",
+            us / 1e3
+        );
+    }
+}
+
+/// A copy of title memory into a host copy, noted for later
+/// (`Shadow::update_later`): the copy and the title range `[from, to)`.
+type Noted = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// A flush's copies with [`refresh_pieces`], as pieces of work: held until
+/// they come to [`CREW_FROM`] bytes, given to the crew from there on.
+#[derive(Default)]
+struct Pieces {
+    cutter: Cutter<std::sync::Arc<crate::shadow::Shadow>>,
+    held: Vec<Vec<Noted>>,
+    held_bytes: usize,
+    crew: Option<crate::crew::Group>,
+}
+
+impl Pieces {
+    /// Takes `copies` (emptied), cut and put together into pieces.
+    fn add(&mut self, copies: &mut Vec<Noted>) {
+        let Self { cutter, held, held_bytes, crew } = self;
+        for (shadow, from, to) in copies.drain(..) {
+            cutter.add(shadow, from, to, &mut |piece, bytes| Self::give(held, held_bytes, crew, piece, bytes));
+        }
+    }
+
+    /// A piece of `bytes` bytes is ready: to the crew if it has the flush's
+    /// pieces already, else held, and all held so far to the crew once they
+    /// come to [`CREW_FROM`] bytes.
+    fn give(held: &mut Vec<Vec<Noted>>, held_bytes: &mut usize, crew: &mut Option<crate::crew::Group>, piece: Vec<Noted>, bytes: usize) {
+        if let Some(group) = crew {
+            group.spawn(move || copy_piece(piece));
+            return;
+        }
+        held.push(piece);
+        *held_bytes += bytes;
+        if *held_bytes >= CREW_FROM && crate::crew::ready() {
+            let group = crate::crew::group();
+            for piece in held.drain(..) {
+                group.spawn(move || copy_piece(piece));
+            }
+            *crew = Some(group);
+        }
+    }
+
+    /// Every piece made: the held ones here, or, if the crew has them, what
+    /// no helper has taken here and the rest waited for.
+    fn finish(self) {
+        let Self {
+            mut cutter,
+            mut held,
+            mut held_bytes,
+            mut crew,
+        } = self;
+        cutter.finish(&mut |piece, bytes| Self::give(&mut held, &mut held_bytes, &mut crew, piece, bytes));
+        match crew {
+            Some(group) => group.wait(),
+            None => {
+                for piece in held {
+                    copy_piece(piece);
+                }
+            }
+        }
+    }
+}
+
+/// Makes the copies of a piece of work, in order.
+fn copy_piece(piece: Vec<Noted>) {
+    for (shadow, from, to) in piece {
+        shadow.copy_now(from, to);
+    }
+}
+
+/// Cuts copies (each a key and a title range `[from, to)`) at the
+/// multiples of [`PIECE_BYTES`] and puts the parts together, in order, into
+/// pieces of at most [`PIECE_BYTES`] bytes: a part that would not fit in
+/// the piece being filled starts the next one. Every byte of every copy is
+/// in one part, and the parts of a copy follow one another.
+struct Cutter<T> {
+    filling: Vec<(T, usize, usize)>,
+    filled: usize,
+}
+
+impl<T> Default for Cutter<T> {
+    fn default() -> Self {
+        Cutter {
+            filling: Vec::new(),
+            filled: 0,
+        }
+    }
+}
+
+impl<T: Clone> Cutter<T> {
+    /// Adds the copy `[from, to)` of `key`; `done` gets each piece filled
+    /// and its bytes.
+    fn add(&mut self, key: T, from: usize, to: usize, done: &mut impl FnMut(Vec<(T, usize, usize)>, usize)) {
+        let mut at = from;
+        while at < to {
+            let end = (at / PIECE_BYTES + 1).saturating_mul(PIECE_BYTES).min(to);
+            if self.filled + (end - at) > PIECE_BYTES {
+                self.finish(done);
+            }
+            self.filling.push((key.clone(), at, end));
+            self.filled += end - at;
+            if self.filled >= PIECE_BYTES {
+                self.finish(done);
+            }
+            at = end;
+        }
+    }
+
+    /// The piece being filled, if it holds anything, to `done`.
+    fn finish(&mut self, done: &mut impl FnMut(Vec<(T, usize, usize)>, usize)) {
+        if !self.filling.is_empty() {
+            done(std::mem::take(&mut self.filling), std::mem::take(&mut self.filled));
+        }
+    }
+}
+
+#[cfg(test)]
+mod piece_tests {
+    use super::{Cutter, PIECE_BYTES};
+
+    /// Copies (key, from, to) through a cutter: the pieces and the bytes
+    /// each was given with.
+    fn cut(copies: &[(u32, usize, usize)]) -> Vec<(Vec<(u32, usize, usize)>, usize)> {
+        let mut cutter = Cutter::default();
+        let mut pieces = Vec::new();
+        for &(key, from, to) in copies {
+            cutter.add(key, from, to, &mut |piece, bytes| pieces.push((piece, bytes)));
+        }
+        cutter.finish(&mut |piece, bytes| pieces.push((piece, bytes)));
+        pieces
+    }
+
+    /// Every byte of every copy is in one part, the parts of a copy follow
+    /// one another in its order, no part crosses a multiple of the piece
+    /// size, and no piece holds more than a piece's bytes; a piece is let
+    /// go only when it is full or the next part would not fit.
+    #[test]
+    fn pieces_hold_every_byte_once_in_order() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut copies = Vec::new();
+        let mut at = 0x2_1234_0000usize;
+        for key in 0..300u32 {
+            // From a few bytes to some 3 MB, aligned or not, with gaps.
+            let len = match next() % 4 {
+                0 => 1 + (next() % 4096) as usize,
+                1 => 64 << 10,
+                2 => (next() % (3 << 20)) as usize + 1,
+                _ => (next() % (600 << 10)) as usize + 1,
+            };
+            at += (next() % 3) as usize * (64 << 10) + if next() % 2 == 0 { 0 } else { (next() % 4096) as usize };
+            copies.push((key, at, at + len));
+            at += len;
+        }
+        // The 174 MB buffer, from an address that is not on a piece's line.
+        copies.push((300, 0x7_0000_1000, 0x7_0000_1000 + (174 << 20)));
+        let pieces = cut(&copies);
+        let mut parts = Vec::new();
+        for (i, (piece, bytes)) in pieces.iter().enumerate() {
+            assert!(!piece.is_empty(), "piece {i} is empty");
+            let sum: usize = piece.iter().map(|&(_, a, b)| b - a).sum();
+            assert_eq!(sum, *bytes, "piece {i}: the bytes it was given with");
+            assert!(sum <= PIECE_BYTES, "piece {i}: {sum} bytes");
+            if let Some((next_piece, _)) = pieces.get(i + 1) {
+                let (_, a, b) = next_piece[0];
+                assert!(sum == PIECE_BYTES || sum + (b - a) > PIECE_BYTES, "piece {i} let go with room for the next part");
+            }
+            for &(key, a, b) in piece {
+                assert!(a < b);
+                assert_eq!(a / PIECE_BYTES, (b - 1) / PIECE_BYTES, "a part across a piece's line: {a:#x}..{b:#x}");
+                parts.push((key, a, b));
+            }
+        }
+        // Read back in order, the parts make the copies again.
+        let mut parts = parts.into_iter().peekable();
+        for &(key, from, to) in &copies {
+            let mut at = from;
+            while at < to {
+                let (k, a, b) = parts.next().expect("a part for every byte");
+                assert_eq!((k, a), (key, at), "copy {key}");
+                at = b;
+            }
+            assert_eq!(at, to, "copy {key} ends where it ends");
+        }
+        assert!(parts.peek().is_none(), "no part of nothing");
+    }
+
+    /// Small copies are put together, big ones cut, and nothing is given
+    /// for nothing.
+    #[test]
+    fn small_copies_together_big_ones_cut() {
+        assert!(cut(&[]).is_empty());
+        // A hundred pages of 4 KiB: one piece.
+        let small: Vec<(u32, usize, usize)> = (0..100).map(|i| (i, 0x10_0000 + i as usize * 8192, 0x10_0000 + i as usize * 8192 + 4096)).collect();
+        let pieces = cut(&small);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].1, 100 * 4096);
+        // A thousand of them: full pieces of 128 and the rest.
+        let small: Vec<(u32, usize, usize)> = (0..1000).map(|i| (i, 0x10_0000 + i as usize * 8192, 0x10_0000 + i as usize * 8192 + 4096)).collect();
+        let pieces = cut(&small);
+        assert_eq!(pieces.len(), 8);
+        assert!(pieces[..7].iter().all(|(p, bytes)| p.len() == 128 && *bytes == PIECE_BYTES));
+        assert_eq!(pieces[7].1, (1000 - 7 * 128) * 4096);
+        // 174 MB on a piece's line: whole pieces.
+        let pieces = cut(&[(0, 0x4_0000_0000, 0x4_0000_0000 + (174 << 20))]);
+        assert_eq!(pieces.len(), (174 << 20) / PIECE_BYTES);
+        assert!(pieces.iter().all(|(p, bytes)| p.len() == 1 && *bytes == PIECE_BYTES));
     }
 }
 
@@ -9778,6 +10265,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        crew_line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();
