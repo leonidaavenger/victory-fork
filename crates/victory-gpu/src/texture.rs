@@ -691,6 +691,13 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    // Asked of the list first, without the set every thread asks below (a
+    // lock all the recording threads take for every texture their draws
+    // read): a texture the list has brought up to date already is done
+    // with, as the question below would find.
+    if list.first_used(resource as usize) {
+        return;
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -705,7 +712,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
-    staging.used.store(crate::host::moment(), Relaxed);
+    // (The thread's note of the moment with `crate::host::clock_lean`.)
+    staging.used.store(if crate::host::clock_lean() { crate::host::moment_noted() } else { crate::host::moment() }, Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at

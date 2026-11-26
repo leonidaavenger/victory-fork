@@ -293,14 +293,72 @@ fn block_class(size: usize) -> usize {
     }
 }
 
+/// With `crate::host::count_lean` (set from it by [`recorded`]: the
+/// allocator cannot read the environment): [`own`] keeps a thread's counts
+/// on the thread and adds them to [`OWN`] every [`OWN_BATCH`] blocks.
+static OWN_BATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The blocks a thread made or released between two of its additions to
+/// [`OWN`] with [`OWN_BATCHED`]: what [`OWN`] says is short of the truth
+/// by at most this many blocks a thread, and their bytes.
+/// shortcut: a thread that ends takes what it holds with it (63 blocks
+/// under 4 KiB at most): the layer's own threads and the title's recording
+/// threads live as long as the process.
+const OWN_BATCH: u32 = 64;
+
+thread_local! {
+    /// This thread's changes to [`OWN`] not added yet, and the blocks they
+    /// are of. (No destructor and a constant start: the allocator may use
+    /// it on any thread at any time, also while the thread ends.)
+    static OWN_HELD: std::cell::Cell<([i64; 8], u32)> = const { std::cell::Cell::new(([0; 8], 0)) };
+}
+
 fn own(size: usize, made: bool) {
     let class = block_class(size);
+    // (Blocks under 4 KiB only: they are nearly all the blocks made, and
+    // there are always thousands of them alive, so that what threads hold
+    // never takes a count below zero; the few bigger ones go in at once.)
+    if class == 0 && OWN_BATCHED.load(Relaxed) {
+        // Two additions to memory every thread adds to, at every block the
+        // process makes or releases: some 4 ms a frame of the recording
+        // threads in profile M12 (`atomic_add`), most of it here.
+        let _ = OWN_HELD.try_with(|held| {
+            let (mut counts, blocks) = held.get();
+            let (bytes, one) = if made { (size as i64, 1) } else { (-(size as i64), -1) };
+            counts[class] += bytes;
+            counts[4 + class] += one;
+            if blocks + 1 < OWN_BATCH {
+                held.set((counts, blocks + 1));
+                return;
+            }
+            held.set(([0; 8], 0));
+            own_add(&counts);
+        });
+        return;
+    }
+    // Back from a turn with it (`alt`): what the thread held goes in first.
+    let _ = OWN_HELD.try_with(|held| {
+        if held.get().1 != 0 {
+            let (counts, _) = held.replace(([0; 8], 0));
+            own_add(&counts);
+        }
+    });
     if made {
         OWN[class].fetch_add(size as u64, Relaxed);
         OWN[4 + class].fetch_add(1, Relaxed);
     } else {
         OWN[class].fetch_sub(size as u64, Relaxed);
         OWN[4 + class].fetch_sub(1, Relaxed);
+    }
+}
+
+/// Adds a thread's held changes to [`OWN`] (the counts wrap as the plain
+/// additions and subtractions do).
+fn own_add(counts: &[i64; 8]) {
+    for (total, &change) in OWN.iter().zip(counts) {
+        if change != 0 {
+            total.fetch_add(change as u64, Relaxed);
+        }
     }
 }
 
@@ -935,7 +993,15 @@ thread_local! {
     static OURS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// List-call time not yet added to `RECORDERS` (nanoseconds, calls).
     static UNSENT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// With `crate::host::count_lean`: list calls (calls, nanoseconds) not
+    /// yet added to the shared counts ([`recorded`]).
+    static HELD_CALLS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
+
+/// The list calls a thread holds before it adds them to the shared counts
+/// ([`recorded`] with `crate::host::count_lean`): some 70 microseconds of
+/// its calls, which a count read at a frame's end misses at most.
+const HELD_MOST: u64 = 16;
 
 fn thread_id() -> u32 {
     // SAFETY: a plain query.
@@ -982,10 +1048,26 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
-    add(C::RecordCalls, 1);
-    add(C::RecordNs, ns);
-    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
-    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    // `crate::host::count_lean`: the two counts of every list call (four
+    // additions to memory all the recording threads add to) are kept on
+    // the thread and added every [`HELD_MOST`] calls; the allocator's
+    // counts likewise ([`OWN_BATCHED`]).
+    let lean = crate::host::count_lean();
+    if OWN_BATCHED.load(Relaxed) != lean {
+        OWN_BATCHED.store(lean, Relaxed);
+    }
+    let [calls, sum] = HELD_CALLS.with(|held| {
+        let mut counts = held.get();
+        let now = crate::host::counts_held(&mut counts, [1, ns], lean, HELD_MOST);
+        held.set(counts);
+        now
+    });
+    if calls > 0 {
+        add(C::RecordCalls, calls);
+        add(C::RecordNs, sum);
+        crate::framelog::add(crate::framelog::T::RecordCalls, calls);
+        crate::framelog::add(crate::framelog::T::RecordNs, sum);
+    }
     crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);

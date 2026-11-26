@@ -27,6 +27,11 @@ use crate::watch::PAGE;
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    /// `buffer`'s bytes and resource flags, as its description has them
+    /// (asked of it once: every buffer view made on the copy asked again,
+    /// a call into the runtime).
+    pub(crate) width: u64,
+    pub(crate) flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -2877,8 +2882,12 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        // SAFETY: a live buffer.
+        let desc = unsafe { buffer.GetDesc() };
         Shadow {
             buffer,
+            width: desc.Width,
+            flags: desc.Flags,
             data,
             gpu,
             start,
@@ -4467,24 +4476,11 @@ fn lookup_lean() -> bool {
 }
 
 /// [`crate::host::moment`] as this thread last read it in this frame: read
-/// again when the frame changes and every 1,024 asks ([`lookup_lean`]).
+/// again when the frame changes and every 1,024 asks ([`lookup_lean`];
+/// the thread's one note, `crate::host::moment_noted`, which
+/// `VICTORY_CLOCK_LEAN` takes too).
 fn moment_noted() -> u64 {
-    thread_local! {
-        /// The frame, the moment read in it, the asks answered from it.
-        static NOTED: std::cell::Cell<(u64, u64, u32)> = const { std::cell::Cell::new((u64::MAX, 0, 0)) };
-    }
-    let frame = crate::frame::current();
-    NOTED.with(|noted| {
-        let (of, moment, asks) = noted.get();
-        if of == frame && asks < 1024 {
-            noted.set((of, moment, asks + 1));
-            moment
-        } else {
-            let moment = crate::host::moment();
-            noted.set((frame, moment, 0));
-            moment
-        }
-    })
+    crate::host::moment_noted()
 }
 
 /// A hit, counted on the thread: added to [`LOOKUPS`] every 256
@@ -4923,7 +4919,15 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
         *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        if crate::host::clock_lean() {
+            // The thread's note of the moment (`crate::host::clock_lean`).
+            let noted = crate::host::moment_noted();
+            if shadow.used.load(Ordering::Relaxed) != noted {
+                shadow.used.store(noted, Ordering::Relaxed);
+            }
+        } else {
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        }
         return Some(shadow.clone());
     }
     if map.len() >= MANY {

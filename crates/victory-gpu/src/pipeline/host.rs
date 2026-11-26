@@ -501,6 +501,10 @@ pub(crate) struct HostPipeline {
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+    /// What its stages read of each root table (`crate::draw` `stage_spans`,
+    /// for `VICTORY_TABLE_STAGES`): worked out at its first bind that asks,
+    /// not at every bind (the stages' resource lists do not change).
+    pub(crate) spans: std::sync::OnceLock<Vec<(u8, u32, u32)>>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -733,6 +737,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                spans: std::sync::OnceLock::new(),
             });
         }
         let Some(g) = g else {
@@ -786,6 +791,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                spans: std::sync::OnceLock::new(),
             });
         }
 
@@ -929,6 +935,7 @@ impl HostPipeline {
                     b.RenderTargetWriteMask
                 )
             },
+            spans: std::sync::OnceLock::new(),
         })
     }
 }
