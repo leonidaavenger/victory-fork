@@ -2097,6 +2097,77 @@ fn uav_back() -> bool {
 /// writes left out, and their bytes.
 static UAV_BACK_LEFT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Where a refresh's copies of title memory go: made as they are found
+/// ([`Shadow::update`]), or noted for the caller ([`Shadow::update_later`]).
+enum Copies<'a> {
+    Now,
+    Later(&'a Arc<Shadow>, &'a mut Later),
+}
+
+impl Copies<'_> {
+    /// Title memory `[from, to)` of `shadow` into it (`Later`: `shadow` is
+    /// the copy it was made for); the bytes, as [`Shadow::copy`] counts
+    /// them.
+    fn copy(&mut self, shadow: &Shadow, from: usize, to: usize) -> usize {
+        match self {
+            Copies::Now => shadow.copy(from, to),
+            Copies::Later(me, later) => {
+                debug_assert!(std::ptr::eq(Arc::as_ptr(me), shadow));
+                let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+                let (from, to) = (from.max(start), to.min(end));
+                if from >= to {
+                    return 0;
+                }
+                later.copies.push((Arc::clone(me), from, to));
+                to - from
+            }
+        }
+    }
+
+    /// The diagnostic look after a refresh of `[from, to)`
+    /// (`VICTORY_REFRESH_CHECK=1`): at once, or, with the copies left for
+    /// later, once they are made ([`Later::check`]).
+    fn check(&mut self, shadow: &Shadow, from: usize, to: usize) {
+        match self {
+            Copies::Now => shadow.refresh_check(from, to),
+            Copies::Later(me, later) => {
+                if refresh_check_on() {
+                    later.checks.push((Arc::clone(me), from, to));
+                }
+            }
+        }
+    }
+}
+
+/// What [`Shadow::update_later`] left to its caller.
+#[derive(Default)]
+pub(crate) struct Later {
+    /// The copies to make, in the order the refresh found them: title
+    /// memory `[from, to)` into the copy ([`Shadow::copy_now`]). Taken by
+    /// the caller as they come.
+    pub(crate) copies: Vec<(Arc<Shadow>, usize, usize)>,
+    /// With `VICTORY_REFRESH_CHECK=1`: the ranges to look at once the
+    /// copies are made.
+    checks: Vec<(Arc<Shadow>, usize, usize)>,
+}
+
+impl Later {
+    /// Once every copy noted has been made: the looks of
+    /// `VICTORY_REFRESH_CHECK=1` (nothing without it).
+    pub(crate) fn check(&mut self) {
+        for (shadow, from, to) in self.checks.drain(..) {
+            shadow.refresh_check(from, to);
+        }
+    }
+}
+
+/// Whether refreshes are looked at afterwards (`VICTORY_REFRESH_CHECK=1`,
+/// [`Shadow::refresh_check`]).
+fn refresh_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+}
+
 /// Whether a refresh of a copy in the card's memory stores and sends on
 /// only the bytes that differ from the copy's CPU side
 /// (`VICTORY_COPY_CHANGED=1`; `alt`: twenty seconds with, twenty without,
@@ -3659,6 +3730,33 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.update_as(address, len, &mut Copies::Now)
+    }
+
+    /// [`Shadow::update`], with the copies of title memory it decides on
+    /// noted in `later` instead of made (`crate::host`'s refresh in pieces,
+    /// `VICTORY_REFRESH_PIECES`): everything else is done here as by
+    /// `update`, in the same order (the write-watch asking or the guards,
+    /// the pages noted taken at that asking), and the caller makes the
+    /// copies ([`Shadow::copy_now`]), on any threads and in any order,
+    /// before anything reads the copy: before the submission's lists go to
+    /// the card, and before the next step of the submission that writes
+    /// title memory or gives a range to shaders. Returns the bytes to copy.
+    ///
+    /// Why the bytes are the same: a copy made later than its asking reads
+    /// title memory as it is then. What the title writes after the asking
+    /// is found by the next one (the kernel's bits were reset by it, the
+    /// guards were armed again before it answered), and is copied then
+    /// again; nothing written before the asking is missed, whenever the
+    /// copy is made. The copies of one refresh write their own bytes of the
+    /// copy, which no other copy of a flush writes (one refresh a copy in
+    /// a flush, its runs apart), and read title memory only.
+    pub(crate) fn update_later(self: &Arc<Self>, address: usize, len: usize, later: &mut Later) -> usize {
+        self.update_as(address, len, &mut Copies::Later(self, later))
+    }
+
+    /// [`Shadow::update`], the copies made as `copies` says.
+    fn update_as(&self, address: usize, len: usize, copies: &mut Copies<'_>) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -3684,27 +3782,27 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, copies);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, copies);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, copies)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(&self, from: usize, to: usize, copies: &mut Copies<'_>) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             // The light refresh (`VICTORY_LIGHT_REFRESH`): nothing of the
             // range was written that the copy does not hold, and the
             // journal says so with nothing asked.
             if crate::watch::light() && self.nothing_new(from, to) {
-                self.refresh_check(from, to);
+                copies.check(self, from, to);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -3715,8 +3813,8 @@ impl Shadow {
             }
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
-                self.refresh_check(from, to);
+                let copied = self.copy_stale(from, to, now, &written, copies);
+                copies.check(self, from, to);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -3731,7 +3829,7 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        copies.copy(self, from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -3760,8 +3858,7 @@ impl Shadow {
     /// the copy and the address. One that differs once is a write of the
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !refresh_check_on() {
             return;
         }
         const SAMPLE: usize = 256;
@@ -3809,8 +3906,8 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    /// asking), whole pages within the buffer (made as `copies` says).
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], copies: &mut Copies<'_>) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -3834,14 +3931,25 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += copies.copy(self, (first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += copies.copy(self, (first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
         bytes
+    }
+
+    /// A copy [`Shadow::update_later`] noted: title memory `[from, to)`
+    /// (inside the buffer, as noted, or a part of it) into the copy, as the
+    /// refresh would have made it. Returns the bytes copied.
+    pub(crate) fn copy_now(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if from.max(start) >= to.min(end) {
+            return 0;
+        }
+        self.copy(from, to)
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -3882,7 +3990,9 @@ impl Shadow {
             }
             // SAFETY: inside the copy's mapping (`from` and `to` are within
             // the buffer); nothing else writes the CPU side of these bytes
-            // while a refresh has them (a refresh is one thread's).
+            // while a refresh has them (a refresh is one thread's; cut into
+            // pieces for several, `crate::host`'s `VICTORY_REFRESH_PIECES`,
+            // its pieces do not overlap).
             let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), n) };
             let stretches = changed_chunks(&now[..n], held, COPY_CHANGED_CHUNK);
             let mut sent = 0;

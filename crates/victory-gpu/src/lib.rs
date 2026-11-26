@@ -28,6 +28,8 @@ mod shot;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod crew;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
