@@ -117,7 +117,177 @@ pub(crate) fn now_ms() -> u64 {
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    let tenths = (now_ms() / 100) & 0xffff_ffff;
+    // (Stored only when it grows: ten times a second.)
+    if TENTHS_SEEN.load(Ordering::Relaxed) < tenths {
+        TENTHS_SEEN.fetch_max(tenths, Ordering::Relaxed);
+    }
+    (crate::frame::current() << 32) | tenths
+}
+
+/// Whether counts that every list call, every block the allocator makes
+/// and every descriptor slot written adds to memory all threads add to are
+/// kept on the thread and added a few dozen at a time
+/// (`VICTORY_COUNT_LEAN=1`; `alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log). Off by default.
+///
+/// Which: the list calls and their nanoseconds (`copystat::recorded`, four
+/// additions a call, 33,000 calls a frame; every 16 calls of a thread), the
+/// diagnostics allocator's blocks and bytes alive (`copystat` `own`, two
+/// additions at every allocation and release; every 64 of a thread), and
+/// the descriptor slots written over an object ([`slot_rewritten`]; every
+/// 64 of a thread). Why: such an addition costs little alone, but five
+/// recording threads adding to the same memory take it from one another
+/// each time; profile M12 has 4.3 ms a frame in `atomic_add`, most of it
+/// from the allocator's counts. What the counts say is the same, later by
+/// at most that many of each thread (shortcut: a thread that ends takes
+/// what it holds with it). Safe to change at any moment: what a thread
+/// holds is added at its next count either way.
+pub(crate) fn count_lean() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_COUNT_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            alt_turn(&LAST, |on| {
+                tracing::info!(
+                    "counts of list calls, of allocations and of descriptor slots written are kept on their threads and added a few dozen at a time from now (VICTORY_COUNT_LEAN=alt): {}",
+                    if on { "ON" } else { "off, each added at once as usual" }
+                );
+            })
+        }
+    }
+}
+
+/// A hash for keys of our own (addresses, pointers, counts, slot numbers:
+/// nothing a stranger chooses) in the tables a list or a draw asks on every
+/// draw: a rotation, a multiply and a fold a word, as `shadow.rs`'s
+/// `AskHash`. The standard one (SipHash) was some 4 ms a frame of the
+/// recording threads in profile M12.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct WordHash(u64);
+
+impl std::hash::Hasher for WordHash {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(word));
+        }
+    }
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(u64::from(v));
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(u64::from(v));
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn finish(&self) -> u64 {
+        // The table takes its place from the low bits and its tag from the
+        // high ones: both get bits of every word.
+        self.0 ^ (self.0 >> 29)
+    }
+}
+
+/// [`WordHash`] for a map or a set.
+pub(crate) type Words = std::hash::BuildHasherDefault<WordHash>;
+
+/// The tenths of a second of the newest [`moment`] any thread read: what
+/// [`alt_turn`] tells its turns by, with no clock read of its own.
+static TENTHS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For a switch set to `alt` that is asked on every draw or more often:
+/// whether this is one of its twenty-second turns with it (the first
+/// twenty seconds are without), told by the moment threads read last
+/// ([`TENTHS_SEEN`]) instead of by a clock read of each ask, and with
+/// `last` (the switch's note of its turn) stored only at a change, where
+/// `say` gives the change's line. The other switches' `alt` read the clock
+/// and store their note on every ask, which costs what some of these
+/// switches save.
+pub(crate) fn alt_turn(last: &std::sync::atomic::AtomicU8, say: impl FnOnce(bool)) -> bool {
+    let on = (TENTHS_SEEN.load(Ordering::Relaxed) / 200) % 2 == 1;
+    if last.load(Ordering::Relaxed) != u8::from(on) && last.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+        say(on);
+    }
+    on
+}
+
+/// [`moment`] as this thread last read it in this frame: read again when
+/// the frame changes and every 1,024 asks. Its frame is always the current
+/// one; its tenths of a second are at most a frame (or 1,024 asks) old.
+/// What tells idle things by it asks for frames gone by as well as for
+/// time ([`long_ago`]), so a thing just used is never taken for an idle
+/// one: only its idle time may start that much early.
+pub(crate) fn moment_noted() -> u64 {
+    thread_local! {
+        /// The frame, the moment read in it, the asks answered from it.
+        static NOTED: std::cell::Cell<(u64, u64, u32)> = const { std::cell::Cell::new((u64::MAX, 0, 0)) };
+    }
+    let frame = crate::frame::current();
+    NOTED.with(|noted| {
+        let (of, moment, asks) = noted.get();
+        if of == frame && asks < 1024 {
+            noted.set((of, moment, asks + 1));
+            moment
+        } else {
+            let moment = self::moment();
+            noted.set((frame, moment, 0));
+            moment
+        }
+    })
+}
+
+/// Whether the per-draw notes of when a host texture or a buffer view's
+/// own copy was last used take the moment from the thread's note of it
+/// ([`moment_noted`]) and store it only where it changes, instead of
+/// reading the clock for each (`VICTORY_CLOCK_LEAN=1`; `alt`: twenty
+/// seconds with, twenty without, in turn, each change said in the log).
+/// Off by default.
+///
+/// Why: every look at a title texture's host side (`resource::hosted`,
+/// about four for each texture a draw reads: its texture, its twin, the
+/// move of its state) read the clock and stored the moment into the
+/// texture, a store into memory the other recording threads that read the
+/// texture store into too. Profile M12 (77.9 ms a frame): the recording
+/// threads spent 16.5 ms a frame reading the clock (`now_ms` 4.4 own,
+/// `RtlQueryPerformanceCounter` 7.3, `mul_div_u64` 4.9), some 83 % of it
+/// under `hosted`. With the switch the clock is read once a frame and
+/// every 1,024 asks per thread (as `VICTORY_LOOKUP_LEAN` does for the
+/// copies of title memory), and what is noted is the same moment, at most
+/// a frame's time early. Safe to change at any moment: either value is a
+/// moment of this frame. (`alt` tells its turns without the clock,
+/// [`alt_turn`]: a clock read for each ask would cost what it saves.)
+pub(crate) fn clock_lean() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CLOCK_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            alt_turn(&LAST, |on| {
+                tracing::info!(
+                    "the uses of host textures and of buffer views' own copies are noted with the thread's note of the moment from now (VICTORY_CLOCK_LEAN=alt): {}",
+                    if on { "ON" } else { "off, the clock read for each as usual" }
+                );
+            })
+        }
+    }
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -435,23 +605,60 @@ pub(crate) static SLOT_REWRITES: [std::sync::atomic::AtomicU64; 3] = [const { st
 /// old reference may go at once (the same object, [`retire_lean`] on).
 pub(crate) fn slot_rewritten(old: &ID3D12Resource, new: Option<&ID3D12Resource>) -> bool {
     let same = new.is_some_and(|new| new.as_raw() == old.as_raw());
-    let before = SLOT_REWRITES[0].fetch_add(1, Ordering::Relaxed);
-    if same {
-        SLOT_REWRITES[1].fetch_add(1, Ordering::Relaxed);
-    }
     let lean = same && retire_lean();
-    if lean {
-        SLOT_REWRITES[2].fetch_add(1, Ordering::Relaxed);
+    // ([`count_lean`]: held on the thread, added every 64.)
+    let (writes, sames, leans) = slot_rewrites_held([1, u64::from(same), u64::from(lean)]);
+    if writes == 0 {
+        return lean;
     }
-    if (before + 1).is_multiple_of(1 << 20) {
+    let before = SLOT_REWRITES[0].fetch_add(writes, Ordering::Relaxed);
+    if sames > 0 {
+        SLOT_REWRITES[1].fetch_add(sames, Ordering::Relaxed);
+    }
+    if leans > 0 {
+        SLOT_REWRITES[2].fetch_add(leans, Ordering::Relaxed);
+    }
+    if before / (1 << 20) != (before + writes) / (1 << 20) {
         tracing::info!(
             "descriptor slots written over an object they held: {} so far, {} of them with the same object; {} old references let go at once (VICTORY_RETIRE_LEAN), the rest retired",
-            before + 1,
+            before + writes,
             SLOT_REWRITES[1].load(Ordering::Relaxed),
             SLOT_REWRITES[2].load(Ordering::Relaxed)
         );
     }
     lean
+}
+
+/// For [`slot_rewritten`]: `add` (writes, of them with the same object, of
+/// them let go at once) to this thread's held counts, and what is to be
+/// added to [`SLOT_REWRITES`] now: all of it without [`count_lean`], every
+/// 64 writes with it (nothing in between).
+fn slot_rewrites_held(add: [u64; 3]) -> (u64, u64, u64) {
+    thread_local! {
+        static HELD: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+    }
+    let lean = count_lean();
+    HELD.with(|held| {
+        let mut counts = held.get();
+        let now = counts_held(&mut counts, add, lean, 64);
+        held.set(counts);
+        (now[0], now[1], now[2])
+    })
+}
+
+/// [`count_lean`]'s bookkeeping for one thread's counts: `add` goes to
+/// `held`, and what is to be added to the shared counts now comes back
+/// (zeros while `held` holds it). With `lean`, `held` holds until its
+/// first count (the events) reaches `most`; without, all it held goes now
+/// with `add`.
+pub(crate) fn counts_held<const N: usize>(held: &mut [u64; N], add: [u64; N], lean: bool, most: u64) -> [u64; N] {
+    for (count, n) in held.iter_mut().zip(add) {
+        *count += n;
+    }
+    if lean && held[0] < most {
+        return [0; N];
+    }
+    std::mem::replace(held, [0; N])
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -1729,6 +1936,12 @@ pub(crate) struct HostList {
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
     gather: Mutex<Gather>,
+    /// The steps recorded so far that may write title memory at the
+    /// submission (title copies, `HostList::defer`'s work), over the list's
+    /// whole life (never set back): a fill of upload memory recorded before
+    /// one of them reads title memory as it is before it
+    /// ([`HostList::title_changes`]).
+    title_changes: std::sync::atomic::AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -3004,19 +3217,21 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// (These sets are asked on every draw and never walked: hashed with
+    /// [`Words`].)
+    refreshed: std::collections::HashSet<(usize, usize, usize), Words>,
     /// With [`list_reuse`]: the host pipelines the list has kept, by
     /// address ([`HostList::first_bind`]).
-    bound: std::collections::HashSet<usize>,
+    bound: std::collections::HashSet<usize, Words>,
     /// With [`list_reuse`]: upload memory filled from title memory since
     /// the last title copy (source, bytes): its host GPU address, which a
     /// second fill would find holding the same bytes
     /// ([`HostList::fill_scratch`]).
-    filled: std::collections::HashMap<(usize, usize), u64>,
+    filled: std::collections::HashMap<(usize, usize), u64, Words>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, Words>,
     /// Last GPU source copied into each aliased host texture in this list.
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: std::collections::HashMap<usize, usize, Words>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -5187,6 +5402,7 @@ impl Host {
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
                 gather: Mutex::default(),
+                title_changes: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -7627,24 +7843,52 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
+        self.transition_legal(resource, wanted).map(|(texture, before, _)| (texture, before))
+    }
+
+    /// [`HostList::transition`], with the state moved to as the texture can
+    /// take it ([`legal_state`]), which the caller's barrier names too (it
+    /// asked the texture for its flags a second time). The title texture's
+    /// host side is looked at once (it was twice: its texture, then its
+    /// copy), and a handle on the copy is taken only at the list's first
+    /// use of it, which is what the list holds; the other uses find the
+    /// copy's entry by its address alone. Some 4,000 textures a frame are
+    /// read through tables, each by several draws.
+    pub(crate) fn transition_legal(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+    ) -> Option<(&'static ID3D12Resource, u32, u32)> {
+        let (texture, key) = crate::resource::host_side(resource)?;
         let wanted = legal_state(texture, wanted);
         // A frame shot names its pictures after the title's textures.
         #[cfg(feature = "diagnostics")]
         if crate::shot::recording() {
-            crate::shot::known(std::sync::Arc::as_ptr(&copy) as usize, resource as usize);
+            crate::shot::known(key, resource as usize);
         }
-        let before = {
+        let found = {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-            match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert((wanted, wanted, copy.clone()));
-                    None
-                }
-                std::collections::hash_map::Entry::Occupied(mut o) => Some(std::mem::replace(&mut o.get_mut().1, wanted)),
+            states.get_mut(&key).map(|entry| {
+                // (The copy, for a frame shot: the handle the list holds.)
+                #[cfg(feature = "diagnostics")]
+                let copy = crate::shot::recording().then(|| entry.2.clone());
+                #[cfg(not(feature = "diagnostics"))]
+                let copy: Option<std::sync::Arc<crate::resource::HostTexture>> = None;
+                (std::mem::replace(&mut entry.1, wanted), copy)
+            })
+        };
+        // The list's first use of the copy: it holds a handle on it from
+        // here on, and records nothing (its prelude moves the texture).
+        let Some((before, copy)) = found else {
+            let copy = crate::resource::host_copy(resource)?;
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            if let std::collections::hash_map::Entry::Vacant(v) = states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+                v.insert((wanted, wanted, copy));
             }
-        }?;
+            return None;
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = copy;
         if before == wanted {
             return None;
         }
@@ -7652,10 +7896,10 @@ impl HostList {
         // write in, and leaves it in that state: the caller's move is the
         // same as in any other frame.
         #[cfg(feature = "diagnostics")]
-        if crate::shot::recording() {
-            crate::shot::leaves(&self.list, std::ptr::from_ref(self) as usize, Some(self), None, &copy, before, wanted);
+        if let Some(copy) = &copy {
+            crate::shot::leaves(&self.list, std::ptr::from_ref(self) as usize, Some(self), None, copy, before, wanted);
         }
-        Some((texture, before))
+        Some((texture, before, wanted))
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -8230,6 +8474,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.title_changes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
@@ -8568,6 +8813,12 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether the list asked [`HostList::first_use`] about `key` since
+    /// its reset (nothing is noted).
+    pub(crate) fn first_used(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
+    }
+
     pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
         let view = view.as_raw() as usize;
         let source = source.as_raw() as usize;
@@ -8577,11 +8828,23 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+        self.title_changes.fetch_add(1, Ordering::Relaxed);
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
         if list_reuse_set() {
             self.deferred().filled.clear();
         }
+    }
+
+    /// What tells the moments of this list's recording between which no
+    /// step that may write title memory at the submission was recorded
+    /// (title copies, [`HostList::defer`]): two equal answers of one list
+    /// have none between them, so upload memory filled from title memory
+    /// at the first holds at the submission what a fill recorded at the
+    /// second would. Never the same for two lists alive at once (the
+    /// list's address is in it).
+    pub(crate) fn title_changes(&self) -> (usize, u64) {
+        (std::ptr::from_ref(self) as usize, self.title_changes.load(Ordering::Relaxed))
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -11090,5 +11353,83 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod lean_tests {
+    use super::{TENTHS_SEEN, WordHash, Words, alt_turn, counts_held};
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// `VICTORY_COUNT_LEAN`'s bookkeeping: a thread holds its counts until
+    /// it has `most` events, then hands all of them over; without the
+    /// switch every count goes at once, with what was held before (a turn
+    /// of `alt` just over). Nothing is lost or counted twice.
+    #[test]
+    fn held_counts_go_in_whole_and_late_by_at_most_a_batch() {
+        let mut held = [0u64; 2];
+        let mut total = [0u64; 2];
+        let add = |now: [u64; 2], total: &mut [u64; 2]| {
+            total[0] += now[0];
+            total[1] += now[1];
+        };
+        for call in 1..=40u64 {
+            let now = counts_held(&mut held, [1, call], true, 16);
+            add(now, &mut total);
+            // Handed over at every 16th, held in between.
+            assert_eq!(now[0] != 0, call % 16 == 0, "call {call}");
+            assert!(held[0] < 16);
+        }
+        assert_eq!(total, [32, (1..=32).sum::<u64>()]);
+        assert_eq!(held, [8, (33..=40).sum::<u64>()]);
+        // The switch off: what was held goes with the next count.
+        let now = counts_held(&mut held, [1, 41], false, 16);
+        add(now, &mut total);
+        assert_eq!(now, [9, (33..=41).sum::<u64>()]);
+        assert_eq!(held, [0, 0]);
+        assert_eq!(total, [41, (1..=41).sum::<u64>()]);
+    }
+
+    /// A switch's `alt` turns follow the tenths of a second threads read
+    /// last: twenty seconds without, twenty with, in turn; its line is said
+    /// once at each change (the first state included) and not again while
+    /// the turn lasts.
+    #[test]
+    fn alt_turns_follow_the_moment_threads_read() {
+        let saved = TENTHS_SEEN.load(Ordering::Relaxed);
+        let last = AtomicU8::new(2);
+        let mut lines = Vec::new();
+        for (tenths, on) in [(0, false), (199, false), (200, true), (250, true), (399, true), (400, false), (600, true)] {
+            TENTHS_SEEN.store(tenths, Ordering::Relaxed);
+            assert_eq!(alt_turn(&last, |on| lines.push(on)), on, "at {tenths} tenths");
+            assert_eq!(alt_turn(&last, |on| lines.push(on)), on, "asked again at {tenths} tenths");
+        }
+        assert_eq!(lines, vec![false, true, false, true]);
+        TENTHS_SEEN.store(saved, Ordering::Relaxed);
+    }
+
+    /// The hash of the per-list tables tells keys apart as a table needs:
+    /// every key put in is found, and keys that differ in one word only
+    /// (as a list's addresses do) do not all share their low bits.
+    #[test]
+    fn the_word_hash_finds_every_key() {
+        use std::hash::{BuildHasher, Hasher};
+        let mut set: std::collections::HashSet<(usize, usize, usize), Words> = Default::default();
+        for i in 0..10_000usize {
+            assert!(set.insert((0x7ff0_0000_0000 + i * 64, 0x1000 + i * 256, 256)));
+        }
+        for i in 0..10_000usize {
+            assert!(set.contains(&(0x7ff0_0000_0000 + i * 64, 0x1000 + i * 256, 256)));
+        }
+        assert!(!set.contains(&(0x7ff0_0000_0000, 0x1000, 257)));
+        let low: std::collections::HashSet<u64> = (0..1024u64)
+            .map(|i| {
+                let mut h = Words::default().build_hasher();
+                h.write_u64(0x2_0000_0000 + i * 4096);
+                h.finish() & 1023
+            })
+            .collect();
+        assert!(low.len() > 512, "{} of 1024 low parts", low.len());
+        let _ = WordHash::default();
     }
 }

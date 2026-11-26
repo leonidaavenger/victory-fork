@@ -588,6 +588,22 @@ pub(crate) fn depth_skip_line(frames: f64) {
     }
 }
 
+/// What [`State::tables`] works in, kept from bind to bind so that its
+/// lists keep their room: an allocation and a release each, for most of
+/// them at every bind, otherwise (allocations were some 10 ms a frame of the
+/// recording threads in profile M12, with their counts in diagnostics
+/// builds).
+#[derive(Default)]
+struct TableScratch {
+    /// The entries of the table being made: their places in the stage's
+    /// used resources.
+    entries: Vec<usize>,
+    /// The table's slots the shader picks by index.
+    selected: Vec<u32>,
+    /// What `tables` returns; given back by `bind` when it is done with it.
+    made: Vec<(u8, u32)>,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -647,7 +663,13 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32, crate::host::Words>,
+    /// With [`table_share`]: the same by what they hold alone, wherever they
+    /// lie: (host heap, slot count, contents) → first dynamic slot, and the
+    /// list's [`HostList::title_changes`] when the table was made.
+    shared_tables: std::collections::HashMap<(usize, u32, u64), (u32, (usize, u64)), crate::host::Words>,
+    /// Lists [`State::tables`] fills at every bind, kept with their room.
+    scratch: TableScratch,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -655,9 +677,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot, crate::host::Words>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, crate::host::Words>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// Diagnostics: the number of this recording of the list, by which the
@@ -694,6 +716,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.shared_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -1221,6 +1244,139 @@ fn table_stages() -> bool {
             on
         }
     }
+}
+
+/// Whether the fingerprint a table made afresh is known by in its list
+/// ([`State::fresh_tables`]) is [`table_print_of`]'s instead of the
+/// standard hash's (`VICTORY_TABLE_PRINT=1`; `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log). Off by default.
+///
+/// Why: every table a draw asks for is fingerprinted from all its slots'
+/// records, some 25,000 tables a frame of 1 to several hundred slots, and
+/// the standard hash (SipHash, fed three words a slot) was most of the
+/// 4-6 ms a frame the recording threads spent in it in profile M12. This
+/// one is two multiplies, two rotations and an add a word. Either is a
+/// 64-bit fingerprint that two different tables share about once in 2^64:
+/// what is found is the same. Safe to change at any moment: a table
+/// fingerprinted the other way is not found, and is made again.
+fn table_print() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_TABLE_PRINT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            crate::host::alt_turn(&LAST, |on| {
+                tracing::info!(
+                    "tables made afresh are known in their list by a fingerprint of our own from now (VICTORY_TABLE_PRINT=alt): {}",
+                    if on { "ON" } else { "off, by the standard hash as usual" }
+                );
+            })
+        }
+    }
+}
+
+/// A fingerprint of the records of the `n` slots of the table at `table`
+/// ([`table_print`]): the tag and two words of each slot, as two 64-bit
+/// words, each through the step XXH64 takes its last words with, then
+/// XXH64's final mix.
+fn table_print_of(table: u64, n: u32) -> u64 {
+    const P1: u64 = 0x9E37_79B1_85EB_CA87;
+    const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const P3: u64 = 0x1656_67B1_9E37_79F9;
+    const P4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const P5: u64 = 0x27D4_EB2F_1656_67C5;
+    let step = |h: u64, word: u64| {
+        (h ^ word.wrapping_mul(P2).rotate_left(31).wrapping_mul(P1))
+            .rotate_left(27)
+            .wrapping_mul(P1)
+            .wrapping_add(P4)
+    };
+    let mut h = P5 ^ u64::from(n);
+    for k in 0..n {
+        let [tag, i, generation] = crate::descriptor::record_at(table + u64::from(k) * 32);
+        h = step(h, u64::from(tag) | u64::from(i) << 32);
+        h = step(h, u64::from(generation));
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(P2);
+    h ^= h >> 29;
+    h = h.wrapping_mul(P3);
+    h ^ (h >> 32)
+}
+
+/// Whether a table a draw needs made afresh is found among the tables its
+/// list made with the same records at another address, and its slots
+/// shown, instead of being made again (`VICTORY_TABLE_SHARE=1`; `alt`:
+/// twenty seconds with, twenty without, in turn, each change said in the
+/// log). Off by default.
+///
+/// Why: the layer's own count (`tables_line`) has 12-15 % of the tables
+/// made hold the records of one made earlier in the same recording of the
+/// same list at another address: the title writes a draw's table anew
+/// for each draw, often with what the draw before had. Each was given
+/// slots of its own and every slot made again (`HostHeap::make_at`, 38 ms
+/// a frame of the recording threads in profile M12, `constant_at`,
+/// `make_null`), the same descriptors as the earlier table's.
+///
+/// What a found table shows is what the earlier one was made from: the
+/// same records, so the same views; and its constants are copied at the
+/// submission from the same title memory, by the fills the earlier one
+/// recorded. That holds only while no step that writes title memory at
+/// the submission was recorded between the two (a title copy, or work of
+/// `HostList::defer`): a table is found only from an earlier one with the
+/// same [`HostList::title_changes`], which also keeps a list's parts apart
+/// (a list cut at a wait has a host list for each part). What a table
+/// made here does besides its slots is done for the one found as well:
+/// the views it reads are made readable (and their memory brought up to
+/// date), and its own title slots of texture views are stamped and made
+/// as the making stamps and makes them. Found tables count as found in
+/// the table line. Safe to change at any moment: a table is only ever
+/// found while the list holds the slots it was made in (both kinds of
+/// memory of tables are emptied together when the list's slots go back).
+/// shortcut: as with a table found at its own address, a view whose
+/// resource was released since the earlier table was made is shown as it
+/// was made, not as the null view a making now would give.
+fn table_share() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_TABLE_SHARE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            crate::host::alt_turn(&LAST, |on| {
+                tracing::info!(
+                    "tables a draw needs made afresh are found among those its list made with the same records elsewhere from now (VICTORY_TABLE_SHARE=alt): {}",
+                    if on { "ON" } else { "off, each made where it is as usual" }
+                );
+            })
+        }
+    }
+}
+
+/// The root parameters of a set of them, one bit each ([`State::tables`]),
+/// lowest first.
+fn slots_of(set: [u64; 4]) -> impl Iterator<Item = u8> {
+    (0..4u32).flat_map(move |word| {
+        let mut bits = set[word as usize];
+        std::iter::from_fn(move || {
+            (bits != 0).then(|| {
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                (word * 64 + bit) as u8
+            })
+        })
+    })
 }
 
 /// For [`table_stages`]: per root table the stages of `p` read, the slots
@@ -1798,12 +1954,14 @@ impl State {
         // With `table_stages`: what the stages of this draw read of each
         // table, and the tables its earlier stages made afresh (address,
         // slots).
-        let spans = if table_stages() { stage_spans(p) } else { Vec::new() };
+        // (Worked out once per pipeline: it was a list and a pass over every
+        // stage's resources at every bind.)
+        let spans: &[(u8, u32, u32)] = if table_stages() { p.spans.get_or_init(|| stage_spans(p)) } else { &[] };
         let mut staged: Vec<(u64, u32)> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, &spans, &mut staged);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1827,7 +1985,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // On the stack: a root signature holds 64 dwords at most.
+                let mut held = [0u32; 64];
+                let mut more = Vec::new();
+                let values: &mut [u32] = match held.get_mut(..dwords as usize) {
+                    Some(values) => values,
+                    None => {
+                        more.resize(dwords as usize, 0);
+                        &mut more
+                    }
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1851,6 +2018,8 @@ impl State {
                     }
                 }
             }
+            // (Its room, for the next stage's tables.)
+            self.scratch.made = made;
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1993,8 +2162,8 @@ impl State {
         });
         let find = |a: u64| {
             let s = crate::shadow::find(a, 1)?;
-            // SAFETY: a live buffer.
-            let flags = unsafe { s.buffer.GetDesc() }.Flags;
+            // (Its description, as the copy has it.)
+            let flags = s.flags;
             if flags.0 & UNORDERED == 0 {
                 once!("a root UAV of a buffer whose host copy shaders cannot write");
                 return None;
@@ -3823,17 +3992,20 @@ impl State {
         staged: &mut Vec<(u64, u32)>,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        // The root parameters whose tables are made afresh, one bit each (a
+        // root parameter is a byte): no list is made and sorted for them at
+        // every bind, and they are walked in the same order, lowest first.
+        let mut fresh = [0u64; 4];
+        let has = |set: &[u64; 4], slot: u8| set[usize::from(slot >> 6)] & 1 << (slot & 63) != 0;
+        let mark = |set: &mut [u64; 4], slot: u8| set[usize::from(slot >> 6)] |= 1 << (slot & 63);
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            mark(&mut fresh, u.slot);
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if has(&fresh, u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -3847,26 +4019,30 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                mark(&mut fresh, u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !has(&fresh, u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        // The lists below are this list's own, kept from bind to bind (an
+        // allocation each at every bind otherwise): the entries of one
+        // table (their places in `used`), the slots picked by index, and
+        // what is returned.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let mut made = std::mem::take(&mut scratch.made);
+        made.clear();
+        for slot in slots_of(fresh) {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            scratch.entries.clear();
+            scratch
+                .entries
+                .extend((0..used.len()).filter(|&i| used[i].root == RootType::Table && used[i].slot == slot));
+            let entries = || scratch.entries.iter().map(move |&i| &used[i]);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3876,24 +4052,22 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            let selected = &mut scratch.selected;
+            selected.clear();
+            selected.extend(indexed.iter().filter(|index| index.table_slot == slot).map(|index| {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                index.byte_offset.wrapping_add(constant << index.shift) / 32
+            }));
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
+            let selected = &scratch.selected;
+            let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .max()
@@ -3921,7 +4095,9 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
+            let print = if table_print() {
+                table_print_of(table, n)
+            } else {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
@@ -3929,11 +4105,72 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, n, h.finish())
+                h.finish()
             };
+            let key = (table, n, print);
             #[cfg(feature = "diagnostics")]
             tally(0, 1);
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            // With `table_share`: a table this list made with the same
+            // records at another address, with no step between then and
+            // now that writes title memory at the submission (so its
+            // constants' fills read what a fill made now would).
+            let share_key = (std::ptr::from_ref(host) as usize, n, print);
+            let found = self.fresh_tables.get(&key).copied();
+            let shared = if found.is_some() || !table_share() {
+                None
+            } else {
+                self.shared_tables
+                    .get(&share_key)
+                    .filter(|&&(_, changes)| changes == list.title_changes())
+                    .map(|&(first, _)| first)
+            };
+            if let Some(first) = shared {
+                #[cfg(feature = "diagnostics")]
+                tally(1, 1);
+                self.fresh_tables.insert(key, first);
+                if !spans.is_empty() {
+                    staged.push((table, n));
+                }
+                // What making the table here would have done but the
+                // making itself, for this table's own entries and its own
+                // title slots: the views it reads made readable, and the
+                // title's slots of the texture views stamped and made in
+                // place (as below).
+                let title_first = heap.index(table).filter(|first| first + n <= host.count());
+                for k in 0..n {
+                    let handle = table + u64::from(k) * 32;
+                    let used = entries().find(|u| u.table_offset_dwords / 8 == k);
+                    match crate::descriptor::view(handle) {
+                        Some(View::Constant(..)) => {}
+                        Some(view) => {
+                            let kind = used.map(|u| u.kind).or_else(|| {
+                                selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                            });
+                            if let Some(kind) = kind {
+                                readable(list, kind, &view);
+                                #[cfg(feature = "diagnostics")]
+                                tally(18, 1);
+                            }
+                            if let Some(title) = title_first
+                                && crate::descriptor::host::is_texture_view(&view)
+                            {
+                                host.texture_slot_tabled(title + k, kind.is_some());
+                                if kind.is_some() {
+                                    host.mirror(title + k, handle, true);
+                                }
+                            }
+                        }
+                        None => {
+                            if used.is_some() {
+                                once!(slot, "a table entry without a view");
+                            }
+                        }
+                    }
+                }
+                made.push((slot, first * 32));
+                continue;
+            }
+            if let Some(first) = found {
                 #[cfg(feature = "diagnostics")]
                 tally(1, 1);
                 // Found in the table an earlier stage of this draw made
@@ -3944,7 +4181,7 @@ impl State {
                     .contains(&(table, n))
                     .then(|| heap.index(table).filter(|at| at + n <= host.count()))
                     .flatten();
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
@@ -3959,8 +4196,8 @@ impl State {
                         tally(18, 1);
                     }
                 }
-                for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                for &k in selected {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3988,6 +4225,11 @@ impl State {
             #[cfg(feature = "diagnostics")]
             clock.lap(21);
             self.fresh_tables.insert(key, first);
+            if table_share() {
+                // (A table made again at its own address with other records
+                // takes the place of the older one here: either is right.)
+                self.shared_tables.insert(share_key, (first, list.title_changes()));
+            }
             if !spans.is_empty() {
                 staged.push((table, n));
             }
@@ -4000,7 +4242,7 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -4064,6 +4306,7 @@ impl State {
             }
             made.push((slot, first * 32));
         }
+        self.scratch = scratch;
         #[cfg(feature = "diagnostics")]
         tally_done();
         made
@@ -4768,8 +5011,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // (Asked only where the line can be said: the texture's flags
+            // were asked of it for every texture every draw reads.)
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(t) = crate::resource::host_resource(*resource as This)
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
@@ -5047,6 +5294,57 @@ mod tests {
         // No records at all: the constants' own.
         put(&mut constants, 0x7c, 2);
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
+    }
+
+    /// The root parameters of a set come out once each, lowest first, as
+    /// the sorted list `State::tables` walked before.
+    #[test]
+    fn the_tables_made_afresh_are_walked_lowest_first() {
+        let mut set = [0u64; 4];
+        for slot in [200u8, 3, 64, 0, 63, 255, 3, 128, 127] {
+            set[usize::from(slot >> 6)] |= 1 << (slot & 63);
+        }
+        assert_eq!(slots_of(set).collect::<Vec<_>>(), vec![0, 3, 63, 64, 127, 128, 200, 255]);
+        assert_eq!(slots_of([0; 4]).count(), 0);
+        assert_eq!(slots_of([u64::MAX; 4]).count(), 256);
+    }
+
+    /// A table's fingerprint (`VICTORY_TABLE_PRINT`) is the same for the
+    /// same records wherever they lie, and another for any other records:
+    /// one word of one slot changed, two slots swapped, one slot more or
+    /// less. Only the first three words of each 32-byte slot count.
+    #[test]
+    fn a_table_print_tells_records_apart() {
+        // Eight slots of 32 bytes (eight words), the tag and two words first.
+        let table = |records: &[[u32; 3]]| -> Vec<[u32; 8]> {
+            records.iter().map(|&[tag, i, generation]| [tag, i, generation, 0, 0, 0, 0, 0]).collect()
+        };
+        let print = |slots: &[[u32; 8]], n: u32| table_print_of(slots.as_ptr() as u64, n);
+        let records: Vec<[u32; 3]> = (0..8).map(|k| [0x7a6b_0001, 100 + k, (1 << 20) | k]).collect();
+        let a = table(&records);
+        let b = table(&records);
+        assert_eq!(print(&a, 8), print(&b, 8), "the same records elsewhere");
+        // The words past the record do not count.
+        let mut c = table(&records);
+        c[5][6] = 0xdead_beef;
+        assert_eq!(print(&a, 8), print(&c, 8));
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(print(&a, 8));
+        for k in 0..8 {
+            for word in 0..3 {
+                for bit in [0, 1, 7, 31] {
+                    let mut other = table(&records);
+                    other[k][word] ^= 1 << bit;
+                    assert!(seen.insert(print(&other, 8)), "slot {k} word {word} bit {bit}");
+                }
+            }
+        }
+        let mut swapped = table(&records);
+        swapped.swap(2, 3);
+        assert!(seen.insert(print(&swapped, 8)));
+        for n in 1..8 {
+            assert!(seen.insert(print(&a, n)), "{n} slots of the same");
+        }
     }
 }
 

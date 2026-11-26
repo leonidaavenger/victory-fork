@@ -147,8 +147,8 @@ impl Memory {
         else {
             return;
         };
-        // SAFETY: a live buffer.
-        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+        // (Its description, as the copy has it.)
+        let flags = shadow.flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
