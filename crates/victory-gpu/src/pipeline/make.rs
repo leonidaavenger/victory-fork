@@ -362,7 +362,14 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        // `VICTORY_PIPELINE_WORKERS=n`: that many workers. Each holds a
+        // driver compile's memory while it works: on a 32 GB PC eight of
+        // them at a world load left under 1.5 GB free, two got through it.
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
