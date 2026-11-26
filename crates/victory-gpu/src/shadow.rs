@@ -4397,12 +4397,117 @@ fn lookup_cache() -> bool {
 /// The most asks a thread remembers before it starts again.
 const FOUND_MOST: usize = 8192;
 
-type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>, std::hash::BuildHasherDefault<AskHash>>;
+
+/// The hash of an ask (two addresses and a flag of ours, nothing a
+/// stranger chooses): a multiply and a rotation a word, where the standard
+/// hash was some 25 ns an ask, 230,000 asks a frame.
+#[derive(Default, Clone, Copy)]
+struct AskHash(u64);
+
+impl std::hash::Hasher for AskHash {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(u64::from(v));
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn finish(&self) -> u64 {
+        // The table takes its place from the low bits and its tag from the
+        // high ones: both get bits of every word.
+        self.0 ^ (self.0 >> 29)
+    }
+}
+
+/// Whether a hit of a thread's memory of its asks ([`lookup`]) stores
+/// nothing other threads read unless it changes it
+/// (`VICTORY_LOOKUP_LEAN=1`; `alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log). Off by default.
+///
+/// Why: a hit added one to a counter all threads share and, for a window
+/// outside buffers, stored the moment, the lowest and the highest address
+/// asked and a count into the copy: up to five stores to memory the other
+/// recording threads store to as well, and a read of the clock, for each
+/// of some 230,000 asks a frame. The profile of run M12 has 24 ms a frame
+/// in `lookup` summed over the recording threads. With the switch the hits
+/// are counted on the thread and added to the counter every 256, the
+/// moment is the thread's own note of this frame's (the clock is read
+/// again when the frame changes and every 1,024 asks), and each note of
+/// the copy is stored only where it changes: the same values, later by at
+/// most that for the moment (a tenth of a second is its unit) and by 255
+/// hits a thread for the counter's line.
+fn lookup_lean() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_LOOKUP_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a hit of a thread's memory of its asks stores only what changes from now (VICTORY_LOOKUP_LEAN=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// [`crate::host::moment`] as this thread last read it in this frame: read
+/// again when the frame changes and every 1,024 asks ([`lookup_lean`]).
+fn moment_noted() -> u64 {
+    thread_local! {
+        /// The frame, the moment read in it, the asks answered from it.
+        static NOTED: std::cell::Cell<(u64, u64, u32)> = const { std::cell::Cell::new((u64::MAX, 0, 0)) };
+    }
+    let frame = crate::frame::current();
+    NOTED.with(|noted| {
+        let (of, moment, asks) = noted.get();
+        if of == frame && asks < 1024 {
+            noted.set((of, moment, asks + 1));
+            moment
+        } else {
+            let moment = crate::host::moment();
+            noted.set((frame, moment, 0));
+            moment
+        }
+    })
+}
+
+/// A hit, counted on the thread: added to [`LOOKUPS`] every 256
+/// ([`lookup_lean`]).
+fn hit_counted() {
+    thread_local! {
+        static HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    HITS.with(|hits| {
+        let n = hits.get() + 1;
+        if n >= 256 {
+            LOOKUPS[0].fetch_add(n, Ordering::Relaxed);
+            hits.set(0);
+        } else {
+            hits.set(n);
+        }
+    });
+}
 
 thread_local! {
     /// What this thread's asks found, and the count of table changes they
     /// are from.
-    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::default()));
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
@@ -4421,6 +4526,28 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     // (The count again: a copy the sweep is taking out of its table at
     // this moment can still be alive for the weak handle.)
     if let Some(shadow) = found.filter(|_| TABLES_CHANGED.load(Ordering::SeqCst) == changes) {
+        if lookup_lean() {
+            hit_counted();
+            if shadow.window {
+                // As below, each note stored only where it changes (what
+                // reads `unsized_asks` asks only whether there were any).
+                let now = moment_noted();
+                if shadow.used.load(Ordering::Relaxed) != now {
+                    shadow.used.store(now, Ordering::Relaxed);
+                }
+                if shadow.asked[0].load(Ordering::Relaxed) > address {
+                    shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+                }
+                let end = address.saturating_add(len.max(1));
+                if shadow.asked[1].load(Ordering::Relaxed) < end {
+                    shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+                }
+                if len <= 1 && shadow.unsized_asks.load(Ordering::Relaxed) == 0 {
+                    shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return Some(shadow);
+        }
         LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
         if shadow.window {
             // As `loose` notes an ask of a window it hands out.
