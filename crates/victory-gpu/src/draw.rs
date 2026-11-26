@@ -817,6 +817,7 @@ pub(crate) fn tables_line(frames: f64) {
     let changed_ms = changed_ns * changed / 1e6;
     let (keeps, kept_waits, kept_waited) = (l[10], l[11], l[12] / 1e6);
     let (next_waits, next_waited) = (l[13], l[14] / 1e6);
+    let (making_waits, making_waited) = (l[15], l[16] / 1e6);
     tracing::info!(
         "the host heap's locks per frame, all threads: the slots' lock (HostHeap::mirror) taken {mirrors_draw:.0} times for draws \
          ({changed_draw:.0} found the slot's record changed) and {mirrors_other:.0} times for writes and the pass over copied records \
@@ -824,7 +825,8 @@ pub(crate) fn tables_line(frames: f64) {
          was held {same_ns:.0} ns a call where the slot was as it was and {changed_ns:.0} ns where it had changed (one call in 16 timed), \
          {same_ms:.1} ms and {changed_ms:.1} ms for all calls at those means; the lock of the resources slots hold (HostHeap::keep) \
          taken {keeps:.0} times, {kept_waits:.0} found it held and waited {kept_waited:.2} ms; the lock of the dynamic slots \
-         (HostHeap::dynamic; its takes are the line above's tables asked): {next_waits:.0} found it held and waited {next_waited:.2} ms"
+         (HostHeap::dynamic; its takes are the line above's tables asked): {next_waits:.0} found it held and waited {next_waited:.2} ms; \
+         the slots' own locks (VICTORY_HEAP_SLOT_LOCKS): {making_waits:.0} takes found one held and waited {making_waited:.2} ms"
     );
     let why: Vec<f64> =
         crate::descriptor::host::DYNAMIC_WHY.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
