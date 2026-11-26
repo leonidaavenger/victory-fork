@@ -452,6 +452,30 @@ fn window_card_most() -> u64 {
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// The share of the card's budget, in percent, up to which windows outside
+/// buffers go to the card's memory ([`window_card_room`]): 80 unless
+/// `VICTORY_CARD_WINDOWS_ROOM_PERCENT` says another (50 to 97).
+///
+/// Why one may want more: a window left in the PC's memory is read over
+/// the bus at every draw, and on a card behind a x4 link that is dear.
+/// Measured there (RTX 4070 Ti, Series S profile, where the card has the
+/// room): with 2,142 MB of windows on the card instead of 962 MB the
+/// card's lists ran 30 ms a frame instead of 40, and the frame rate went
+/// from 14.8 to 16.7. On the Series X profile the card is past 80 % of
+/// its budget before most windows are asked for (textures picked by index
+/// are made up to `VICTORY_TEXTURE_ROOM_PERCENT`, 90), so every window is
+/// turned down: a higher share here with a lower one there gives the
+/// windows the room.
+fn window_card_room_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_ROOM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(50, 97))
+    })
+}
+
 /// Whether windows that go to the card's memory are one buffer in a GPU
 /// upload heap, which the CPU fills directly (`VICTORY_WINDOW_UPLOAD=1`;
 /// off by default), where the device has such heaps
@@ -538,7 +562,7 @@ fn window_card_room(size: u64, how: &str) -> bool {
         }
     };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_card_room_percent()
     {
         say(1, "no room on the card for");
         return false;
