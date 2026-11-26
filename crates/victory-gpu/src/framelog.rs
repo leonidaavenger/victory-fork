@@ -343,7 +343,7 @@ pub(crate) fn free_mb() -> u64 {
 }
 
 /// Values read when a frame ends, all running totals but the last.
-const S: usize = 11;
+const S: usize = 15;
 const S_THREAD_USER: usize = 0;
 const S_THREAD_KERNEL: usize = 1;
 const S_PROCESS_USER: usize = 2;
@@ -356,6 +356,9 @@ const S_STAGING_REUSED: usize = 8;
 const S_STAGING_MADE: usize = 9;
 /// Not a total: the free memory then.
 const S_FREE_MB: usize = 10;
+/// Draws by what they draw into (`crate::draw::drawn_into`), and dispatches.
+const S_DRAWS_INTO: usize = 11;
+const S_DISPATCHES: usize = 14;
 
 fn sample() -> [u64; S] {
     let (tu, tk) = thread_times();
@@ -372,6 +375,10 @@ fn sample() -> [u64; S] {
         crate::texture::SPARE_STATS[0].load(Relaxed),
         crate::texture::SPARE_STATS[1].load(Relaxed),
         free_mb(),
+        crate::draw::drawn_into()[0],
+        crate::draw::drawn_into()[1],
+        crate::draw::drawn_into()[2],
+        crate::draw::dispatched(),
     ]
 }
 
@@ -428,7 +435,7 @@ fn text(f: &Frame) -> String {
          readers; of it the system's unmapping {:.1}, its mapping {:.1}, committing {:.1}, our own notes of the change \
          {:.1}; {:.0} views cut, {:.1} MB of them mapped again) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
-         draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
+         draws ({:.0} into four or more colour targets, {:.0} into one to three, {:.0} depth only; {:.0} dispatches) | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
         s(S_THREAD_USER) / 1e3,
@@ -486,6 +493,10 @@ fn text(f: &Frame) -> String {
         s(S_PROCESS_KERNEL) / 1e3,
         ms(T::PaceUs),
         s(S_DRAWS),
+        s(S_DRAWS_INTO),
+        s(S_DRAWS_INTO + 1),
+        s(S_DRAWS_INTO + 2),
+        s(S_DISPATCHES),
         s(S_FREE_MB),
         t(T::RenderSlow),
         t(T::RenderLooks),

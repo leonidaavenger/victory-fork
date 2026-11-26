@@ -1025,6 +1025,16 @@ fn mesh_kept(pipeline: usize) -> bool {
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
+/// Draws run on the host so far by what they draw into, for the frame
+/// log: four or more colour targets (the title's material pass), one to
+/// three, none (depth only: shadow maps and the picture's own depth).
+static DRAWN_INTO: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`DRAWN_INTO`]'s totals.
+pub(crate) fn drawn_into() -> [u64; 3] {
+    [0, 1, 2].map(|i| DRAWN_INTO[i].load(Ordering::Relaxed))
+}
+
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
@@ -1766,6 +1776,17 @@ impl State {
             .filter(|&&h| h != 0)
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| h.index(handle).is_some())
+    }
+
+    /// Counts a draw run on the host by its colour targets
+    /// ([`DRAWN_INTO`]).
+    fn drew_into(&self) {
+        let kind = match self.targets.len() {
+            0 => 2,
+            1..=3 => 1,
+            _ => 0,
+        };
+        DRAWN_INTO[kind].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether this draw is one `VICTORY_SKIP_DEPTH_DRAWS` leaves out
@@ -3862,6 +3883,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    self.drew_into();
                     true
                 }
                 Err(_) => false,
@@ -4410,6 +4432,7 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drew_into();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4512,6 +4535,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drew_into();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4872,6 +4896,7 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drew_into();
         }
         true
     }
